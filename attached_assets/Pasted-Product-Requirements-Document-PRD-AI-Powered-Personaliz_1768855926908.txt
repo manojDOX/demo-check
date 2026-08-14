@@ -1,0 +1,542 @@
+Product Requirements Document (PRD)
+AI-Powered Personalized Website with Visual Editor
+Executive Summary
+This project delivers an AI-powered, single-page website platform that dynamically personalizes content for each visitor. The system identifies users through both anonymous tracking and authenticated login, retrieves customer profile data from BigQuery, and adapts content in real-time based on visitor behavior and profile attributes. A visual drag-and-drop editor enables non-technical users to design and redesign the website without coding.
+
+Product Vision
+Create a next-generation web experience that combines:
+
+Intelligent visitor identification (anonymous + authenticated)
+Enterprise data integration (BigQuery customer profiles)
+AI-powered content generation (OpenAI)
+Visual design flexibility (drag-and-drop editor)
+Behavioral intelligence (navigation tracking and personalization)
+Technical Architecture
+Technology Stack
+Frontend:
+
+React SPA (Single Page Application)
+Tailwind CSS for styling
+Shadcn UI component library
+GrapesJS or Craft.js for drag-and-drop page builder
+FingerprintJS for anonymous visitor identification
+React Router for navigation tracking
+React DnD for drag-and-drop interactions
+Backend:
+
+Express.js REST API
+PostgreSQL database
+Google Cloud BigQuery client library (@google-cloud/bigquery)
+OpenAI API integration
+Session management with secure cookies
+Google Cloud service account authentication
+Core Features - MVP
+1. Visual Drag-and-Drop Page Builder
+Purpose: Enable non-technical users to design and redesign the website visually
+
+Capabilities:
+
+Component library with pre-built elements (headers, text blocks, images, buttons, forms, CTAs)
+Drag-and-drop interface for layout creation
+Live preview mode showing real-time design changes
+Component property editor for customizing:
+Colors and gradients
+Typography (fonts, sizes, weights)
+Spacing and padding
+Responsive breakpoints (mobile, tablet, desktop)
+Save and publish functionality
+Design persistence in PostgreSQL
+User Flow:
+
+Access editor interface (admin/designer role)
+Drag components from library onto canvas
+Configure component properties via side panel
+Preview design in real-time
+Save draft or publish live
+2. Content Zone Mapping System
+Purpose: Designate which page areas should display personalized content
+
+Capabilities:
+
+Mark specific components as "personalization zones"
+Assign segment rules to each zone
+Configure fallback content for unmatched visitors
+Map zones to content library or AI generation
+Configuration Options:
+
+Static content: Same for all visitors
+Segmented content: Different content per user segment
+AI-generated content: Dynamically created based on profile data
+Behavioral content: Adapted based on navigation history
+3. Anonymous Visitor Tracking
+Purpose: Identify and track visitors who haven't logged in
+
+Technical Implementation:
+
+Browser fingerprinting using FingerprintJS
+Session cookies for returning visitor recognition
+PostgreSQL storage of:
+Unique anonymous visitor ID
+First visit timestamp
+Last visit timestamp
+Visit count
+Device/browser information
+Referral source
+Privacy Considerations:
+
+Cookie consent mechanism
+GDPR-compliant data retention policies
+Anonymous ID cannot be reverse-engineered to PII
+4. Navigation Behavior Logging
+Purpose: Capture detailed visitor interaction patterns for personalization
+
+Tracked Events:
+
+Page interactions (clicks, scrolls, hovers)
+Time spent on page/sections
+Click patterns and sequences
+Form interactions (started, completed, abandoned)
+CTA engagement rates
+Content consumption depth
+Data Storage:
+
+PostgreSQL tables for behavior events
+Indexed by visitor ID (anonymous or authenticated)
+Timestamp-based for temporal analysis
+Aggregated metrics for quick retrieval
+5. User Registration and Login System
+Purpose: Enable visitor authentication to access personalized experiences
+
+Features:
+
+Email/password registration
+Secure login with session management
+Password reset functionality
+Profile management interface
+Automatic session handling with secure cookies
+Authentication Flow:
+
+Visitor registers or logs in
+System creates authenticated session
+Anonymous visitor data merges with user profile (future phase)
+BigQuery profile data becomes accessible
+Content personalizes based on authenticated identity
+6. BigQuery Integration
+Purpose: Query customer profile datasets for personalization data
+
+Technical Setup:
+
+Google Cloud service account authentication
+BigQuery client library integration
+Configurable dataset and table mappings
+Query optimization for low-latency responses
+Profile Data Access:
+
+Customer demographic information
+Purchase history and preferences
+Engagement scores
+Lifecycle stage
+Custom attributes
+Behavioral segments
+API Layer:
+
+Express.js endpoints for BigQuery queries
+Caching layer to minimize query costs
+Error handling for unavailable data
+Fallback to default content when query fails
+7. PostgreSQL Data Management
+Purpose: Store application data, visitor tracking, and content library
+
+Database Schema:
+
+Tables:
+
+anonymous_visitors - Anonymous visitor profiles
+navigation_events - Behavior tracking data
+user_accounts - Authenticated user credentials
+page_designs - Saved page layouts from visual editor
+content_library - Pre-stored content organized by segments
+segments - Customer segment definitions and rules
+personalization_rules - Mapping between segments and content
+Performance Optimization:
+
+Indexed queries for fast visitor lookup
+Connection pooling
+Prepared statements for security
+Regular backups
+8. Visitor Identification Engine
+Purpose: Seamlessly switch between anonymous and authenticated states
+
+Logic Flow:
+
+1. Visitor arrives
+2. Check for existing session cookie
+   - If exists → Load visitor profile (anonymous or authenticated)
+   - If new → Create anonymous visitor ID
+3. Check authentication status
+   - If logged in → Query BigQuery for profile data
+   - If anonymous → Use behavioral data only
+4. Determine visitor segment based on available data
+5. Trigger content personalization
+State Management:
+
+Real-time state updates via React context
+Persistent state across page refreshes
+Automatic re-personalization on login/logout
+9. Content Segmentation System
+Purpose: Organize visitors into segments for targeted content delivery
+
+Segment Definition:
+
+Rule-based criteria (e.g., industry = "healthcare")
+Behavioral patterns (e.g., visited pricing page 3+ times)
+BigQuery profile attributes (e.g., customer_tier = "enterprise")
+Combined multi-condition rules
+Segment Types:
+
+Profile-based: Derived from BigQuery data
+Behavioral: Based on navigation patterns
+Hybrid: Combination of profile + behavior
+Default: Fallback for unmatched visitors
+Segment Priority:
+
+Authenticated users → BigQuery profile segments
+Anonymous returning visitors → Behavioral segments
+New anonymous visitors → Default segment
+10. Pre-Stored Content Library
+Purpose: Repository of content variants organized by segments
+
+Content Types:
+
+Headlines and subheadlines
+Body copy and descriptions
+Images and media assets
+Call-to-action buttons
+Testimonials and social proof
+Pricing information
+Organization:
+
+Tagged by segment IDs
+Versioned for A/B testing (future phase)
+Metadata for search and filtering
+Content approval workflow (future phase)
+Retrieval Logic:
+
+Match visitor segment to content tags
+Prioritize most specific matches
+Fallback to default content if no match
+Cache frequently accessed content
+11. AI Content Generation
+Purpose: Dynamically create personalized content using OpenAI
+
+Use Cases:
+
+Generate custom headlines based on visitor industry
+Create personalized product descriptions
+Compose tailored email copy
+Adapt messaging tone based on customer lifecycle stage
+Implementation:
+
+OpenAI API integration (GPT-4 or later)
+Prompt engineering templates
+Variables populated from BigQuery profile data
+Response caching to minimize API costs
+Fallback to pre-stored content on API failure
+Prompt Strategy:
+
+System: You are a marketing copywriter personalizing content.
+User: Create a headline for [visitor_segment] interested in [product_category] 
+with tone [professional/casual] based on profile: [bigquery_data]
+Quality Controls:
+
+Content length limits
+Brand voice guidelines in prompts
+Human review queue (future phase)
+Automated toxicity filtering
+12. Real-Time Content Adaptation Engine
+Purpose: Render designed layouts with dynamically selected personalized content
+
+Process Flow:
+
+Load page design from PostgreSQL (saved via visual editor)
+Identify visitor and determine segment
+For each personalization zone:
+Check zone configuration (static/segmented/AI)
+Retrieve appropriate content from library or generate via AI
+Query BigQuery if profile data needed
+Render final page with personalized content
+Track interaction for behavioral analysis
+Performance Optimization:
+
+Parallel content fetching (BigQuery + content library + AI)
+Optimistic rendering (show default, swap personalized)
+Client-side caching of content variants
+Service worker for offline capability (future phase)
+User Experience:
+
+Seamless content transitions
+No visible loading states for cached content
+Fallback to default content if personalization fails
+Progressive enhancement approach
+13. Responsive Single-Page Design
+Purpose: Ensure consistent experience across all devices
+
+Responsive Strategy:
+
+Mobile-first design approach
+Breakpoints: 640px (mobile), 768px (tablet), 1024px (desktop)
+Touch-friendly interactions
+Optimized images for different screen sizes
+Performance:
+
+Code splitting for faster initial load
+Lazy loading of below-fold content
+Minified CSS and JavaScript
+CDN delivery for static assets
+System Integration Architecture
+┌─────────────────────────────────────────────────────────┐
+│                    VISITOR BROWSER                       │
+│  ┌────────────────────────────────────────────────┐    │
+│  │  React SPA + Visual Editor                     │    │
+│  │  - FingerprintJS (anonymous ID)                │    │
+│  │  - Session cookies                             │    │
+│  │  - Behavior tracking                           │    │
+│  └────────────────┬───────────────────────────────┘    │
+└───────────────────┼──────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────┐
+│                 EXPRESS.JS API LAYER                     │
+│  ┌──────────────────────────────────────────────┐      │
+│  │  - Authentication middleware                 │      │
+│  │  - Visitor identification service            │      │
+│  │  - Content personalization engine            │      │
+│  │  - API rate limiting & caching               │      │
+│  └──────────────────────────────────────────────┘      │
+└────────┬──────────────┬──────────────┬──────────────────┘
+         │              │              │
+         ▼              ▼              ▼
+┌────────────┐  ┌──────────────┐  ┌──────────────┐
+│ PostgreSQL │  │   BigQuery   │  │  OpenAI API  │
+│            │  │              │  │              │
+│ - Visitors │  │ - Customer   │  │ - Content    │
+│ - Behavior │  │   Profiles   │  │   Generation │
+│ - Content  │  │ - Segments   │  │              │
+│ - Designs  │  │ - History    │  │              │
+└────────────┘  └──────────────┘  └──────────────┘
+Data Flow Examples
+Scenario 1: New Anonymous Visitor
+1. Visitor lands on website
+2. FingerprintJS generates unique ID → Store in PostgreSQL
+3. Check segment rules → Assign to "Default" segment
+4. Load page design from PostgreSQL
+5. Retrieve default content from content library
+6. Render page
+7. Track navigation behavior → Log to PostgreSQL
+Scenario 2: Returning Anonymous Visitor
+1. Visitor returns (recognized by fingerprint + cookie)
+2. Retrieve visitor profile from PostgreSQL
+3. Analyze navigation history
+4. Assign to behavioral segment (e.g., "Pricing Page Visitors")
+5. Load personalized content for that segment
+6. Render page with targeted messaging
+7. Continue tracking behavior
+Scenario 3: Authenticated User
+1. User logs in
+2. Create authenticated session
+3. Query BigQuery with user email/ID
+4. Retrieve customer profile (industry, tier, purchase history)
+5. Determine segment from BigQuery data (e.g., "Enterprise Healthcare")
+6. Generate AI content personalized to profile:
+   - Prompt: "Create headline for enterprise healthcare customer"
+   - Include relevant case studies and features
+7. Render highly personalized page
+8. Track behavior + update BigQuery (future phase)
+User Roles and Permissions
+Designer/Admin
+Access visual page builder
+Create and edit page designs
+Configure personalization zones
+Manage content library
+Define segments and rules
+View analytics (future phase)
+End Visitor
+View personalized website
+Register and login
+Interact with content
+No backend access
+API Endpoints (Express.js)
+Visitor Management
+POST /api/visitors/identify - Create/retrieve visitor profile
+GET /api/visitors/:id - Get visitor data
+POST /api/visitors/:id/track - Log navigation event
+Authentication
+POST /api/auth/register - Create user account
+POST /api/auth/login - Authenticate user
+POST /api/auth/logout - End session
+POST /api/auth/reset-password - Password recovery
+Content
+GET /api/content/:segment - Retrieve content for segment
+POST /api/content/generate - AI content generation
+GET /api/content/library - Browse content library
+BigQuery
+GET /api/bigquery/profile/:userId - Fetch customer profile
+POST /api/bigquery/query - Custom BigQuery queries
+Page Design
+GET /api/design/current - Load published page design
+POST /api/design/save - Save page design
+POST /api/design/publish - Publish design to production
+Segmentation
+GET /api/segments - List all segments
+POST /api/segments - Create new segment
+GET /api/segments/:visitorId/match - Determine visitor segment
+Configuration Requirements
+Environment Variables
+# Database
+DATABASE_URL=postgresql://...
+DATABASE_POOL_SIZE=20
+# Google Cloud BigQuery
+GOOGLE_CLOUD_PROJECT_ID=your-project-id
+GOOGLE_CLOUD_KEYFILE=./service-account-key.json
+BIGQUERY_DATASET=customer_profiles
+BIGQUERY_TABLE=profiles
+# OpenAI
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o
+OPENAI_MAX_TOKENS=500
+# Session
+SESSION_SECRET=your-secure-secret-key
+SESSION_TIMEOUT=86400
+# App
+PORT=3000
+NODE_ENV=production
+ALLOWED_ORIGINS=https://yourdomain.com
+Google Cloud Service Account
+Create service account with BigQuery Data Viewer role
+Download JSON key file
+Store securely (not in version control)
+OpenAI API Key
+Sign up for OpenAI account
+Generate API key
+Configure usage limits and billing
+Next Phase Features
+1. Anonymous-to-Identified User Merging
+When anonymous visitor logs in, merge their behavioral data with authenticated profile for complete view.
+
+2. Behavioral Scoring System
+Predictive scoring to anticipate visitor interests based on navigation patterns.
+
+3. Content Recommendation Engine
+Suggest content based on similar user profiles in BigQuery using collaborative filtering.
+
+4. BigQuery Streaming Inserts
+Update customer profiles in real-time with behavioral data from the website.
+
+5. ML-Based Segmentation
+Use machine learning clustering on BigQuery data to automatically discover new segments.
+
+Success Metrics
+Performance KPIs
+Page load time < 2 seconds
+Time to personalized content < 500ms
+BigQuery query response < 1 second
+AI content generation < 3 seconds
+Business KPIs
+Conversion rate increase from personalization
+Engagement time per segment
+Return visitor rate
+Content relevance scores
+Technical KPIs
+API uptime > 99.5%
+Error rate < 0.1%
+Cache hit rate > 80%
+Database query performance
+Security Considerations
+Data Protection
+All API communications over HTTPS
+Encrypted database connections
+Secure session cookie with httpOnly flag
+Password hashing with bcrypt
+Rate limiting on authentication endpoints
+Privacy Compliance
+Cookie consent mechanism
+Data retention policies
+User data export capability (GDPR)
+Right to be forgotten implementation
+Anonymous data cannot link to PII
+API Security
+API key rotation policy
+Service account key protection
+Input validation and sanitization
+SQL injection prevention (parameterized queries)
+XSS protection in React
+Deployment Architecture on Replit
+Replit Environment
+Single deployment with Express.js + React build
+PostgreSQL database via Replit
+Environment secrets management
+Automatic scaling on Google Cloud Platform
+Custom domain with SSL
+Build Process
+Build React app (npm run build)
+Express serves static build files
+API routes handle dynamic requests
+PostgreSQL connection pooling
+External API calls (BigQuery, OpenAI)
+Testing Strategy
+Unit Tests
+React component testing
+API endpoint testing
+Database query testing
+Segmentation logic testing
+Integration Tests
+Full visitor flow (anonymous → authenticated)
+BigQuery integration
+OpenAI content generation
+Page builder save/load
+Performance Tests
+Load testing with multiple concurrent visitors
+BigQuery query performance
+Content caching effectiveness
+Database connection pooling
+Timeline Estimate
+Phase 1: Foundation (Weeks 1-2)
+
+Project setup and database schema
+Basic Express.js API structure
+React app scaffolding
+Authentication system
+Phase 2: Core Features (Weeks 3-5)
+
+Anonymous visitor tracking
+BigQuery integration
+Content library and segmentation
+Basic personalization engine
+Phase 3: Visual Editor (Weeks 6-8)
+
+Drag-and-drop page builder integration
+Component library creation
+Design save/load functionality
+Content zone mapping
+Phase 4: AI & Polish (Weeks 9-10)
+
+OpenAI integration
+AI content generation
+Performance optimization
+Testing and bug fixes
+Risk Mitigation
+Technical Risks
+BigQuery latency: Implement aggressive caching, fallback content
+OpenAI rate limits: Queue system, pre-generated content backup
+Database performance: Connection pooling, query optimization, indexing
+Business Risks
+Data privacy concerns: Clear consent mechanisms, compliance documentation
+Cost overruns (APIs): Usage monitoring, budget alerts, caching strategies
+Conclusion
+This platform delivers a sophisticated personalization engine combining:
+
+Visual design flexibility for non-technical users
+Enterprise data integration via BigQuery
+AI-powered dynamic content generation
+Comprehensive visitor tracking and behavioral analysis
+The React SPA architecture on Replit provides optimal performance for this use case, with client-side personalization delivering fast, seamless experiences for both anonymous and authenticated visitors.
