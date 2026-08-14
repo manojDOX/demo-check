@@ -94,6 +94,49 @@ def _looks_like_bq_rows(structured) -> bool:
     return isinstance(structured, dict) and ("schema" in structured or "rows" in structured)
 
 
+_DATE_FIELD_TYPES = {"DATE", "DATETIME", "TIMESTAMP", "TIME"}
+_NUMERIC_FIELD_TYPES = {"INT64", "INTEGER", "FLOAT64", "FLOAT", "NUMERIC", "BIGNUMERIC"}
+
+
+def _humanize_column(name: str) -> str:
+    return name.replace("_", " ").strip().title()
+
+
+def _infer_charts(fields: list[dict], data: list[dict]) -> list[dict]:
+    """Heuristic chart suggestion straight from the BigQuery result schema — no extra LLM
+    round trip needed. A date/time-typed column becomes a line-chart x-axis (trend over
+    time); any other non-numeric column becomes a bar-chart x-axis (category breakdown).
+    Deliberately returns [] (table-only) when there's nothing meaningful to plot: a single
+    scalar-result row (e.g. "how many customers do we have"), or no numeric column to use
+    as a y-axis at all (e.g. a plain SELECT DISTINCT listing)."""
+    if len(data) < 2:
+        return []
+    field_types = {f.get("name"): (f.get("type") or "").upper() for f in fields}
+    numeric_cols = [c for c, t in field_types.items() if t in _NUMERIC_FIELD_TYPES]
+    if not numeric_cols:
+        return []
+    date_cols = [c for c, t in field_types.items() if t in _DATE_FIELD_TYPES]
+    x_field = date_cols[0] if date_cols else next(
+        (c for c in field_types if c not in numeric_cols), None
+    )
+    if x_field is None:
+        return []
+    y_field = next((c for c in numeric_cols if c != x_field), None)
+    if y_field is None:
+        return []
+    chart_type = "line" if date_cols else "bar"
+    return [
+        {
+            "type": chart_type,
+            "title": f"{_humanize_column(y_field)} by {_humanize_column(x_field)}",
+            "x_field": x_field,
+            "y_field": y_field,
+            "x_label": _humanize_column(x_field),
+            "y_label": _humanize_column(y_field),
+        }
+    ]
+
+
 def _done_event(billable: bool, confidence: float, tables_used: list[str]) -> dict:
     return {"type": "done", "billable": billable, "confidence": confidence, "tables_used": tables_used}
 
@@ -263,13 +306,17 @@ async def stream_single_query(
                         if _is_sql_tool(name) and _looks_like_bq_rows(structured):
                             columns, data, total_rows = _parse_bq_rows(structured)
                             data_rows = data[:500]
+                            fields = ((structured.get("schema") or {}).get("fields") or [])
                             yield {
                                 "type": "rows",
                                 "columns": columns,
                                 "data": data_rows,
                                 "total_rows": total_rows,
                                 "truncated": total_rows > len(data_rows),
-                                "viz": {"show_table": True, "charts": []},
+                                "viz": {
+                                    "show_table": True,
+                                    "charts": _infer_charts(fields, data_rows),
+                                },
                             }
                         payload = structured if structured is not None else result
                         result_content = json.dumps(payload, default=str)
