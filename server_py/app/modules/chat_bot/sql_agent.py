@@ -98,8 +98,19 @@ def _done_event(billable: bool, confidence: float, tables_used: list[str]) -> di
     return {"type": "done", "billable": billable, "confidence": confidence, "tables_used": tables_used}
 
 
+def _sql_only_tools(mcp_tools: list[dict]) -> list[dict]:
+    """Strips schema/discovery tools (list_dataset_ids, get_table_info, ...) out of what's
+    offered to the model. Safe only because this deployment's schema is static and baked
+    into MCP_STATIC_SCHEMA_SYSTEM_PROMPT — the model never needs to look anything up.
+    Falls back to the full tool list if, for some reason, no SQL-execution tool is found
+    (e.g. the hosted MCP server renames its tools), so the agent degrades gracefully
+    instead of being left with zero usable tools."""
+    filtered = [t for t in mcp_tools if _is_sql_tool(t.get("name", ""))]
+    return filtered or mcp_tools
+
+
 def _build_initial_messages(conversation_history: list[dict] | None, message: str) -> list[dict]:
-    messages: list[dict] = [{"role": "system", "content": prompts.MCP_TOOL_CALLING_SYSTEM_PROMPT}]
+    messages: list[dict] = [{"role": "system", "content": prompts.MCP_STATIC_SCHEMA_SYSTEM_PROMPT}]
     for turn in conversation_history or []:
         role = turn.get("role")
         content = turn.get("content")
@@ -148,7 +159,7 @@ async def stream_single_query(
             yield _done_event(False, 0.0, [])
             return
 
-        openai_format_tools = mcp_tools_to_openai_format(mcp_tools)
+        openai_format_tools = mcp_tools_to_openai_format(_sql_only_tools(mcp_tools))
         messages = _build_initial_messages(conversation_history, message)
         tables_used: list[str] = []
 
@@ -242,10 +253,11 @@ async def stream_single_query(
                             "QUERY FAILED — this did NOT run successfully and returned NO data. "
                             f"Error from BigQuery: {error_text or 'unknown error'}. "
                             "Do not answer the user's question as if this succeeded or returned "
-                            "empty results — that would be fabricating an answer. If you guessed a "
-                            "table/column name, call get_table_info to check the real schema, then "
-                            "retry with a corrected query. If you're out of ideas, tell the user what "
-                            "went wrong instead of making up numbers."
+                            "empty results — that would be fabricating an answer. Re-check the exact "
+                            "column names and types listed in your system instructions — the schema "
+                            "there is complete and authoritative — fix the query accordingly and "
+                            "retry. If you're out of ideas, tell the user what went wrong instead of "
+                            "making up numbers."
                         )
                     else:
                         if _is_sql_tool(name) and _looks_like_bq_rows(structured):

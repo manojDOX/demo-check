@@ -6,17 +6,9 @@ section 8). Supported providers: openai, anthropic, gemini, groq, openrouter
 (groq/openrouter route through the OpenAI-compatible chat-completions API with a
 different base_url).
 
-Public interface (depended on by sql_agent.py / service.py — do not change signatures):
+Public interface (depended on by sql_agent.py / router.py — do not change signatures):
 
     async def discover_models(provider: str, api_key: str) -> dict
-    async def call_llm(provider, model, api_key, messages, max_tokens=3000, temperature=0.2) -> str
-    async def stream_llm(provider, model, api_key, messages, max_tokens=1000, temperature=0.7) -> AsyncGenerator[str, None]
-    def parse_llm_json(text: str) -> dict
-    def recover_sql_from_truncated_json(text: str) -> str | None
-
-Also (added for the MCP tool-calling pipeline, sql_agent.py — see CHATBOT_ARCHITECTURE.md
-port task, "MCP tool-calling architecture"):
-
     def mcp_tools_to_openai_format(mcp_tools: list[dict]) -> list[dict]
     async def call_llm_with_tools(provider, model, api_key, messages, tools, max_tokens=3000, temperature=0.2) -> dict
     def messages_with_tool_result(provider, tool_call_id, tool_name, result_content) -> list[dict]
@@ -35,8 +27,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
-from typing import AsyncGenerator
 
 import anthropic
 import google.generativeai as genai
@@ -118,12 +108,9 @@ _NON_CHAT_MODEL_MARKERS = (
     "similarity",
 )
 
-# gen_max_tokens is bumped for Gemini specifically: the schema/rules payload for
-# SQL-generation-style JSON prompts (discovery CTEs, entity-validation CTEs,
-# multi-chart response_format, etc.) routinely exceeds the default 3000-token
-# budget for Gemini and leaves the JSON response truncated. Only applied in
-# call_llm (used for the JSON-producing SQL-gen/validation/fix calls), not in
-# stream_llm (used for the plain-text streamed narrative answer).
+# gen_max_tokens is bumped for Gemini specifically: the schema + tool-calling system
+# prompt payload routinely exceeds the default 3000-token budget for Gemini and leaves
+# the response truncated mid tool-call. Applied in _gemini_tools_call.
 _GEMINI_MIN_MAX_TOKENS = 6000
 _DEFAULT_CALL_MAX_TOKENS = 3000
 
@@ -149,28 +136,6 @@ def _split_system(messages: list[dict]) -> tuple[str, list[dict]]:
     system_parts = [m.get("content", "") for m in messages if m.get("role") == "system"]
     rest = [m for m in messages if m.get("role") != "system"]
     return "\n\n".join(p for p in system_parts if p), rest
-
-
-def _to_gemini_contents(messages: list[dict]) -> list[dict]:
-    """Gemini uses role "model" instead of "assistant"; each turn is {role, parts}."""
-    contents = []
-    for m in messages:
-        role = "model" if m.get("role") == "assistant" else "user"
-        contents.append({"role": role, "parts": [m.get("content", "")]})
-    return contents
-
-
-def _gemini_wants_json(messages: list[dict]) -> bool:
-    """Detects whether any message asks for JSON output (case-insensitive), and if
-    so, JSON response mode is turned on. This was the single largest source of
-    "LLM returned unparseable response" failures for Gemini — without it, the
-    model would wrap JSON in markdown fences or prose despite instructions."""
-    for m in messages:
-        content = (m.get("content") or "")
-        low = content.lower()
-        if "valid json" in low or "respond with json" in low:
-            return True
-    return False
 
 
 def _pick_default(provider: str, available: list[str]) -> str | None:
@@ -281,261 +246,6 @@ async def _discover_gemini_models(api_key: str) -> dict:
 
     default = _pick_default("gemini", ids)
     return {"default_model": default, "available_models": ids}
-
-
-# ---------------------------------------------------------------------------
-# call_llm (single non-streaming completion)
-# ---------------------------------------------------------------------------
-
-
-async def call_llm(
-    provider: str,
-    model: str,
-    api_key: str,
-    messages: list[dict],
-    max_tokens: int = 3000,
-    temperature: float = 0.2,
-) -> str:
-    """Single non-streaming completion. `messages` is
-    [{"role": "system"|"user"|"assistant", "content": str}, ...].
-    Returns the text content. Raises on failure (let caller handle)."""
-    p = _normalize_provider(provider)
-    if p == "anthropic":
-        return await _anthropic_call(model, api_key, messages, max_tokens, temperature)
-    if p == "gemini":
-        return await _gemini_call(model, api_key, messages, max_tokens, temperature)
-    return await _openai_compat_call(p, model, api_key, messages, max_tokens, temperature)
-
-
-async def _anthropic_call(model: str, api_key: str, messages: list[dict], max_tokens: int, temperature: float) -> str:
-    system_text, rest = _split_system(messages)
-    client = AsyncAnthropic(api_key=api_key)
-    kwargs = {"system": system_text} if system_text else {}
-    resp = await client.messages.create(
-        model=model, max_tokens=max_tokens, temperature=temperature, messages=rest, **kwargs
-    )
-    return "".join(block.text for block in resp.content if getattr(block, "type", None) == "text")
-
-
-async def _openai_compat_call(
-    provider: str, model: str, api_key: str, messages: list[dict], max_tokens: int, temperature: float
-) -> str:
-    base_url = _OPENAI_COMPAT_BASE_URLS.get(provider)
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url) if base_url else AsyncOpenAI(api_key=api_key)
-    resp = await client.chat.completions.create(
-        model=model, messages=messages, max_tokens=max_tokens, temperature=temperature
-    )
-    return resp.choices[0].message.content or ""
-
-
-async def _gemini_call(model: str, api_key: str, messages: list[dict], max_tokens: int, temperature: float) -> str:
-    genai.configure(api_key=api_key)
-    effective_max_tokens = max_tokens
-    if effective_max_tokens <= _DEFAULT_CALL_MAX_TOKENS:
-        effective_max_tokens = _GEMINI_MIN_MAX_TOKENS
-
-    system_text, rest = _split_system(messages)
-    gen_config_kwargs = {"max_output_tokens": effective_max_tokens, "temperature": temperature}
-    if _gemini_wants_json(messages):
-        gen_config_kwargs["response_mime_type"] = "application/json"
-    generation_config = genai.types.GenerationConfig(**gen_config_kwargs)
-
-    gm = genai.GenerativeModel(
-        model, system_instruction=system_text or None, generation_config=generation_config
-    )
-    contents = _to_gemini_contents(rest)
-    resp = await gm.generate_content_async(contents)
-    return resp.text or ""
-
-
-# ---------------------------------------------------------------------------
-# stream_llm (async-generator chunk streaming)
-# ---------------------------------------------------------------------------
-
-
-async def stream_llm(
-    provider: str,
-    model: str,
-    api_key: str,
-    messages: list[dict],
-    max_tokens: int = 1000,
-    temperature: float = 0.7,
-) -> AsyncGenerator[str, None]:
-    """Async generator yielding text chunks (str) as they arrive from the provider."""
-    p = _normalize_provider(provider)
-    if p == "anthropic":
-        async for chunk in _anthropic_stream(model, api_key, messages, max_tokens, temperature):
-            yield chunk
-    elif p == "gemini":
-        async for chunk in _gemini_stream(model, api_key, messages, max_tokens, temperature):
-            yield chunk
-    else:
-        async for chunk in _openai_compat_stream(p, model, api_key, messages, max_tokens, temperature):
-            yield chunk
-
-
-async def _anthropic_stream(
-    model: str, api_key: str, messages: list[dict], max_tokens: int, temperature: float
-) -> AsyncGenerator[str, None]:
-    system_text, rest = _split_system(messages)
-    client = AsyncAnthropic(api_key=api_key)
-    kwargs = {"system": system_text} if system_text else {}
-    async with client.messages.stream(
-        model=model, max_tokens=max_tokens, temperature=temperature, messages=rest, **kwargs
-    ) as stream:
-        async for text in stream.text_stream:
-            yield text
-
-
-async def _openai_compat_stream(
-    provider: str, model: str, api_key: str, messages: list[dict], max_tokens: int, temperature: float
-) -> AsyncGenerator[str, None]:
-    base_url = _OPENAI_COMPAT_BASE_URLS.get(provider)
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url) if base_url else AsyncOpenAI(api_key=api_key)
-    stream = await client.chat.completions.create(
-        model=model, messages=messages, max_tokens=max_tokens, temperature=temperature, stream=True
-    )
-    async for chunk in stream:
-        if not chunk.choices:
-            continue
-        delta = chunk.choices[0].delta.content
-        if delta:
-            yield delta
-
-
-async def _gemini_stream(
-    model: str, api_key: str, messages: list[dict], max_tokens: int, temperature: float
-) -> AsyncGenerator[str, None]:
-    genai.configure(api_key=api_key)
-    system_text, rest = _split_system(messages)
-    gen_config_kwargs = {"max_output_tokens": max_tokens, "temperature": temperature}
-    if _gemini_wants_json(messages):
-        gen_config_kwargs["response_mime_type"] = "application/json"
-    generation_config = genai.types.GenerationConfig(**gen_config_kwargs)
-
-    gm = genai.GenerativeModel(
-        model, system_instruction=system_text or None, generation_config=generation_config
-    )
-    contents = _to_gemini_contents(rest)
-    resp = await gm.generate_content_async(contents, stream=True)
-    async for chunk in resp:
-        try:
-            text = chunk.text
-        except ValueError:
-            # Chunk has no text parts (e.g. only a function-call/safety block); skip.
-            text = ""
-        if text:
-            yield text
-
-
-# ---------------------------------------------------------------------------
-# parse_llm_json — tolerant JSON extraction
-# ---------------------------------------------------------------------------
-
-_BACKSLASH_NEWLINE_RE = re.compile(r"\\\r?\n")
-_FENCED_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
-
-
-def _extract_balanced_json_object(text: str) -> str | None:
-    """Scans for the first `{...}` substring with balanced braces, respecting
-    JSON string literals (so braces inside quoted strings don't throw off the
-    balance count)."""
-    start = text.find("{")
-    if start == -1:
-        return None
-
-    depth = 0
-    in_string = False
-    escape = False
-    for i in range(start, len(text)):
-        ch = text[i]
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return None  # never closed (truncated)
-
-
-def parse_llm_json(text: str) -> dict:
-    """Tolerant JSON extraction: repairs backslash-newline artifacts, tries fenced
-    ```json blocks first, then the full text, then a {...} substring scan.
-    Raises ValueError if nothing parses."""
-    if text is None or not text.strip():
-        raise ValueError("Empty response from LLM; cannot parse JSON.")
-
-    repaired = _BACKSLASH_NEWLINE_RE.sub("", text)
-
-    for match in _FENCED_BLOCK_RE.finditer(repaired):
-        candidate = match.group(1).strip()
-        if not candidate:
-            continue
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-
-    try:
-        return json.loads(repaired.strip())
-    except json.JSONDecodeError:
-        pass
-
-    obj_text = _extract_balanced_json_object(repaired)
-    if obj_text is not None:
-        try:
-            return json.loads(obj_text)
-        except json.JSONDecodeError:
-            pass
-
-    raise ValueError("Could not parse a JSON object from the LLM response.")
-
-
-# ---------------------------------------------------------------------------
-# recover_sql_from_truncated_json
-# ---------------------------------------------------------------------------
-
-_SQL_FIELD_RE = re.compile(r'"sql"\s*:\s*"((?:\\.|[^"\\])*)"?', re.DOTALL)
-
-
-def recover_sql_from_truncated_json(text: str) -> str | None:
-    """Port of `_recover_sql_from_truncated_json` — regex-extracts just the "sql"
-    field's string value from a JSON object that may never have closed (truncated
-    by max_tokens). Returns None if no "sql" field pattern is found."""
-    if not text:
-        return None
-
-    match = _SQL_FIELD_RE.search(text)
-    if not match:
-        return None
-
-    raw = match.group(1)
-    if not raw or not raw.strip():
-        return None
-
-    # Try to decode as a proper JSON string, trimming trailing characters in case
-    # the value itself was cut mid-escape-sequence by truncation.
-    candidate = raw
-    for _ in range(4):
-        try:
-            return json.loads('"' + candidate + '"')
-        except json.JSONDecodeError:
-            if not candidate:
-                break
-            candidate = candidate[:-1]
-
-    # Best-effort manual unescape fallback.
-    return raw.replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
 
 
 # ---------------------------------------------------------------------------
