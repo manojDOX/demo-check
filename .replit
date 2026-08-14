@@ -1,13 +1,12 @@
-modules = ["nodejs-20", "python-3.12", "web", "postgresql-16"]
+modules = ["nodejs-20", "python-3.12", "web"]
 run = "bash -c \"cd server_py && python -m uvicorn app.main:app --host 0.0.0.0 --port 5000\""
 hidden = [".config", ".git", "generated-icon.png", "node_modules", "dist", "server_py/.venv"]
 
 [nix]
-channel = "stable-24_05"
+channel = "stable-25_05"
 
 [[ports]]
 localPort = 5000
-externalPort = 80
 
 [env]
 PORT = "5000"
@@ -45,6 +44,7 @@ integrations = ["javascript_openai:1.0.0", "javascript_database:1.0.0", "javascr
 
 [userenv.shared]
 GHL_LOCATION_ID = "vNsR6W7J8sDcZ2ZGS1sb"
+FERNET_KEY = "KJ4fw-SAZ38TQgfeAeh45DiPN84JAXDQmXptxob14Ho="
 
 [objectStorage]
-defaultBucketID = "replit-objstore-8f5908c9-60c4-4e3a-a03c-7c468a63f47d"
+defaultBucketID = "replit-objstore-34be547d-18f4-40aa-b219-a831ccd0603b"
