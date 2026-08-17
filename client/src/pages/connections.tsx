@@ -23,6 +23,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import {
   Database,
@@ -39,6 +40,7 @@ import {
   Building2,
   Link2,
   Unlink,
+  ShieldCheck,
 } from "lucide-react";
 import {
   DropdownMenu,
@@ -57,7 +59,6 @@ export default function Connections() {
   const [selectedClientId, setSelectedClientId] = useState<string>("");
   const [name, setName] = useState("");
   const [projectId, setProjectId] = useState("");
-  const [datasetId, setDatasetId] = useState("");
   const [credentials, setCredentials] = useState("");
   const [showCredentials, setShowCredentials] = useState(false);
 
@@ -84,7 +85,6 @@ export default function Connections() {
       const response = await apiRequest("POST", "/api/connections", {
         name,
         projectId,
-        datasetId,
         credentials,
       });
       return response.json();
@@ -156,7 +156,6 @@ export default function Connections() {
   const resetForm = () => {
     setName("");
     setProjectId("");
-    setDatasetId("");
     setCredentials("");
   };
 
@@ -197,27 +196,15 @@ export default function Connections() {
                   data-testid="input-connection-name"
                 />
               </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label htmlFor="projectId">Project ID</Label>
-                  <Input
-                    id="projectId"
-                    placeholder="my-project-123"
-                    value={projectId}
-                    onChange={(e) => setProjectId(e.target.value)}
-                    data-testid="input-project-id"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="datasetId">Dataset ID (optional)</Label>
-                  <Input
-                    id="datasetId"
-                    placeholder="retail_data"
-                    value={datasetId}
-                    onChange={(e) => setDatasetId(e.target.value)}
-                    data-testid="input-dataset-id"
-                  />
-                </div>
+              <div className="space-y-2">
+                <Label htmlFor="projectId">Project ID</Label>
+                <Input
+                  id="projectId"
+                  placeholder="my-project-123"
+                  value={projectId}
+                  onChange={(e) => setProjectId(e.target.value)}
+                  data-testid="input-project-id"
+                />
               </div>
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
@@ -254,6 +241,17 @@ export default function Connections() {
                   This will be encrypted and stored securely. Never shared or logged.
                 </p>
               </div>
+              <Alert>
+                <ShieldCheck className="h-4 w-4" />
+                <AlertDescription>
+                  <p className="mb-1.5">The service account above needs these IAM roles granted on the BigQuery project:</p>
+                  <ul className="space-y-0.5 font-mono text-xs">
+                    <li>roles/mcp.toolUser</li>
+                    <li>roles/bigquery.jobUser</li>
+                    <li>roles/bigquery.dataViewer</li>
+                  </ul>
+                </AlertDescription>
+              </Alert>
             </div>
             <DialogFooter>
               <Button variant="outline" onClick={() => setIsAddDialogOpen(false)}>
