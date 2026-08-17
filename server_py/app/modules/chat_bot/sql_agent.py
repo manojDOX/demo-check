@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import AsyncGenerator
+from datetime import datetime, timezone
 
 from app.modules.chat_bot import guardrails, prompts
 from app.modules.chat_bot.config import CHATBOT_MAX_TOOL_RESULT_CHARS, CHATBOT_MAX_TOOL_ROUNDS
@@ -65,22 +66,44 @@ def _extract_tables_used(sql: str) -> list[str]:
     return seen
 
 
+_TIMESTAMP_FIELD_TYPES = {"TIMESTAMP", "DATETIME"}
+
+
+def _convert_bq_cell(value, field_type: str):
+    """BigQuery's legacy tabledata REST shape returns TIMESTAMP/DATETIME columns as a
+    string of raw Unix epoch seconds (e.g. "1785966448.226") — live-verified against the
+    real hosted MCP server. That's meaningless to show a user, and the LLM cannot reliably
+    convert it to a calendar date itself (verified: it was guessing plausible-looking but
+    wrong dates instead). Converted here, once, into a plain "YYYY-MM-DD HH:MM:SS UTC"
+    string so both the LLM's tool-result view and the frontend's rows/table/chart display
+    see a real date instead of a raw epoch number."""
+    if field_type in _TIMESTAMP_FIELD_TYPES and isinstance(value, str) and value:
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        except (TypeError, ValueError, OverflowError, OSError):
+            return value
+    return value
+
+
 def _parse_bq_rows(structured: dict) -> tuple[list[str], list[dict], int]:
     """Parses the BigQuery legacy-REST tabledata shape returned in an
     execute_sql(_readonly) tool result's `structuredContent`:
         {"schema": {"fields": [{"name","type","mode"}, ...]},
          "rows": [{"f": [{"v": ...}, ...]}, ...], ...}
-    into (columns, [{col: value, ...}, ...], total_row_count)."""
+    into (columns, [{col: value, ...}, ...], total_row_count). TIMESTAMP/DATETIME values
+    are converted from raw epoch seconds to a readable date string along the way."""
     schema = structured.get("schema") or {}
     fields = schema.get("fields") or []
     columns = [f.get("name") for f in fields]
+    field_types = [(f.get("type") or "").upper() for f in fields]
     raw_rows = structured.get("rows") or []
     data: list[dict] = []
     for row in raw_rows:
         cells = row.get("f") or []
         record = {}
-        for name, cell in zip(columns, cells):
-            record[name] = cell.get("v") if isinstance(cell, dict) else cell
+        for name, ftype, cell in zip(columns, field_types, cells):
+            value = cell.get("v") if isinstance(cell, dict) else cell
+            record[name] = _convert_bq_cell(value, ftype)
         data.append(record)
     total_rows = structured.get("totalRows")
     try:
