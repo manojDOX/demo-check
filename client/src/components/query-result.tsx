@@ -568,12 +568,13 @@ export function QueryResult({
   });
 
   // Determine the label key (x-axis) and numeric data keys (y-axis)
-  const labelKey = sortedData.length > 0 
-    ? (Object.keys(sortedData[0]).find(k => 
-        k === "name" || k === "label" || k === "month" || k === "date" || 
-        k.includes("_name") || k.includes("_id") || k.includes("mes") || 
-        k.includes("fecha") || k.includes("period")
-      ) || Object.keys(sortedData[0])[0]) 
+  const labelKey = sortedData.length > 0
+    ? (Object.keys(sortedData[0]).find(k =>
+        k === "name" || k === "label" || k === "month" || k === "date" ||
+        k.includes("_name") || k.includes("_id") || k.includes("mes") ||
+        k.includes("fecha") || k.includes("period") ||
+        k.endsWith("_date") || k.endsWith("_at") || k.includes("date")
+      ) || Object.keys(sortedData[0])[0])
     : "name";
   
   // Get numeric keys for chart data (exclude the label key, non-numeric fields, and year/id columns)
