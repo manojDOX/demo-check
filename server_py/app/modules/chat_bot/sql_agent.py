@@ -38,6 +38,24 @@ from app.modules.chat_bot.mcp_client import BigQueryMCPClient
 # below is a defensive net in case Google renames/adds an execute-style tool later.
 _KNOWN_SQL_TOOL_NAMES = {"execute_sql_readonly", "execute_sql"}
 
+# Belt-and-braces cleanup for the final answer text: the chat UI renders it as plain text
+# (no markdown parser — see query-result.tsx's `<p>{summary}</p>`), but LLMs reliably reach
+# for **bold**/markdown syntax regardless of the prompt's "PLAIN TEXT ONLY" instruction —
+# live-verified across providers that the instruction alone isn't consistently followed.
+# Strips just the bold markers (the specific defect actually observed: literal "**Name**"
+# reaching the screen) — deliberately NOT touching single "_"/"*" since those appear inside
+# real content here (e.g. email addresses like "c_navedo@icloud.com").
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
+_MD_HEADER_RE = re.compile(r"(?m)^#{1,6}[ \t]+")
+
+
+def _strip_markdown_formatting(text: str) -> str:
+    if not text:
+        return text
+    text = _MD_HEADER_RE.sub("", text)
+    text = _MD_BOLD_RE.sub(lambda m: m.group(1) or m.group(2) or "", text)
+    return text
+
 
 def _is_sql_tool(name: str) -> bool:
     if name in _KNOWN_SQL_TOOL_NAMES:
@@ -246,7 +264,7 @@ async def stream_single_query(
             tool_calls = response.get("tool_calls")
 
             if not tool_calls:
-                content = (response.get("content") or "").strip()
+                content = _strip_markdown_formatting((response.get("content") or "").strip())
                 if content:
                     yield {"type": "text", "content": content}
                 else:
