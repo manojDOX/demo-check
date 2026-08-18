@@ -13,6 +13,14 @@ event dicts (`status`, `sql`, `rows`, `text`, `error`, `done` — snake_case key
 `done`-with-session_id are NOT emitted here — service.py owns those (it does consume this
 module's own `done` event for its `billable`/`confidence`/`tables_used` fields, then emits
 its own final `done`).
+
+Two-stage pipeline (see prompts.py): stage 1's tool-calling loop below only ever writes and
+executes SQL (prompts.build_sql_generation_system_prompt, no schema-lookup tools offered).
+The moment a SQL tool call returns real rows, the loop breaks and hands off to stage 2 — a
+SEPARATE, tools-free LLM call (prompts.build_answer_generation_system_prompt) that turns
+those rows into the final analyst-voice text. Stage 1 never produces the user-facing answer
+itself except in the "no data needed / out of scope" case, where it answers directly without
+ever calling a tool.
 """
 
 from __future__ import annotations
@@ -249,6 +257,12 @@ async def stream_single_query(
         openai_format_tools = mcp_tools_to_openai_format(_sql_only_tools(mcp_tools))
         messages = _build_initial_messages(conversation_history, message)
         tables_used: list[str] = []
+        # Set the moment a SQL tool call comes back with real rows — once this is populated
+        # the round loop below breaks out and hands off to a SEPARATE answer-generation call
+        # (prompts.build_answer_generation_system_prompt) instead of letting the SAME
+        # tool-calling conversation produce the final text itself. Stays None through
+        # tool-call errors/retries, so those still loop normally within step 1.
+        successful_result: dict | None = None
 
         status_labels = ["Thinking…", "Looking up your data…", "Analyzing your question…"]
 
@@ -350,17 +364,25 @@ async def stream_single_query(
                         if _is_sql_tool(name) and _looks_like_bq_rows(structured):
                             columns, data, total_rows = _parse_bq_rows(structured)
                             data_rows = data[:500]
+                            truncated = total_rows > len(data_rows)
                             fields = ((structured.get("schema") or {}).get("fields") or [])
                             yield {
                                 "type": "rows",
                                 "columns": columns,
                                 "data": data_rows,
                                 "total_rows": total_rows,
-                                "truncated": total_rows > len(data_rows),
+                                "truncated": truncated,
                                 "viz": {
                                     "show_table": True,
                                     "charts": _infer_charts(fields, data_rows),
                                 },
+                            }
+                            successful_result = {
+                                "sql": sql,
+                                "columns": columns,
+                                "data": data_rows,
+                                "total_rows": total_rows,
+                                "truncated": truncated,
                             }
                         payload = structured if structured is not None else result
                         result_content = json.dumps(payload, default=str)
@@ -373,13 +395,49 @@ async def stream_single_query(
 
                 messages.extend(messages_with_tool_result(provider, call["id"], name, result_content))
 
-        # --- Round limit exhausted without a final answer -------------------------------
-        yield {
-            "type": "text",
-            "content": "I wasn't able to finish answering that within the allowed number of steps. "
-            "Try asking a narrower question.",
-        }
-        yield _done_event(False, 0.2, tables_used)
+            if successful_result is not None:
+                break
+        else:
+            # --- Round limit exhausted without ever getting a successful query result ---
+            yield {
+                "type": "text",
+                "content": "I wasn't able to finish answering that within the allowed number of steps. "
+                "Try asking a narrower question.",
+            }
+            yield _done_event(False, 0.2, tables_used)
+            return
+
+        # --- Step 2: hand the successful query result to a SEPARATE answer-generation call,
+        # rather than letting the step-1 tool-calling conversation produce the final text
+        # itself. No tools offered here — this call only turns already-fetched rows into an
+        # analyst-voice answer, it never queries anything itself. -----------------------
+        yield {"type": "status", "label": "Writing your answer…"}
+        query_result_block = prompts.format_query_result_block(
+            successful_result["sql"],
+            successful_result["columns"],
+            successful_result["data"],
+            successful_result["total_rows"],
+            successful_result["truncated"],
+        )
+        answer_messages = [
+            {"role": "system", "content": prompts.build_answer_generation_system_prompt(message, query_result_block)},
+            {"role": "user", "content": message},
+        ]
+        try:
+            answer_response = await call_llm_with_tools(
+                provider, model, api_key, answer_messages, [], max_tokens=1500, temperature=0.3
+            )
+        except Exception as error:
+            yield {"type": "error", "content": f"Couldn't get a response from the model: {error}"}
+            yield _done_event(False, 0.0, tables_used)
+            return
+
+        content = _strip_markdown_formatting((answer_response.get("content") or "").strip())
+        if content:
+            yield {"type": "text", "content": content}
+        else:
+            yield {"type": "text", "content": "I found the data but couldn't put together an answer for it."}
+        yield _done_event(True, 0.9 if content else 0.2, tables_used)
     finally:
         await mcp.aclose()
 

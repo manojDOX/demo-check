@@ -7,11 +7,9 @@ the model reads any DDL, and <RULES> for SQL-writing mechanics + verified data-r
 gotchas. This is the prompt sql_agent.py's tool-calling loop actually uses today.
 
 Step 2 (build_answer_generation_system_prompt): query result -> business answer in the
-analyst's voice, with <BUSINESS_CONTEXT> instead of a schema. Prompt text is written and
-tested standalone (see the bottom of this file), but NOT YET WIRED into sql_agent.py — the
-live pipeline still produces its final answer from within the same step-1 tool-calling loop,
-not via a separate call to this prompt. Wiring that up (a genuine second LLM call after SQL
-execution) is a deliberate follow-up, not done here.
+analyst's voice, with <BUSINESS_CONTEXT> instead of a schema. Wired into sql_agent.py as a
+genuinely SEPARATE LLM call (no tools offered) made once step 1's tool-calling loop gets a
+successful query result — it does not reuse step 1's conversation/system prompt.
 
 This deployment spans 5 fixed views (only the GCP project differs per BigQuery connection,
 force-injected into every tool call's `projectId` argument by sql_agent.py, so it never needs
