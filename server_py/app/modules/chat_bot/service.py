@@ -18,7 +18,7 @@ from app.modules.connections import repo as connections_repo
 from app.modules.kpi import repo as kpi_repo
 from app.modules.team import repo as team_repo
 
-_HISTORY_LOAD_LIMIT = 20
+_HISTORY_LOAD_LIMIT = 5
 _HISTORY_ROWS_SAMPLE = 5
 
 

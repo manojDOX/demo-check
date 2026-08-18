@@ -1,29 +1,29 @@
-"""The chatbot's system prompt: a fixed single-table (`customer_360_vw`) MCP tool-calling
-assistant for the "Ask Your Data" chat feature.
+"""Chatbot prompts, split by pipeline step.
 
-This is the only prompt actually used by the live pipeline (sql_agent.py). Everything here
-is loaded once at import time — the schema is static (see CUSTOMER_360_TABLE_ID /
-_CUSTOMER_360_SCHEMA below), so there is no per-request templating beyond the one-time
-`.format()` that bakes the table id and column list into MCP_STATIC_SCHEMA_SYSTEM_PROMPT.
+Step 1 (build_sql_generation_system_prompt): natural-language question -> SQL. Follows the
+text-to-SQL best-practice pattern from F:\\replit\\Prompting.md — schema as CREATE TABLE DDL
+wrapped in <SQL_SCHEMA>, a <TABLE_GUIDE> mapping business intent to the right table before
+the model reads any DDL, and <RULES> for SQL-writing mechanics + verified data-reality
+gotchas. This is the prompt sql_agent.py's tool-calling loop actually uses today.
 
-`customer_360_vw` itself is a BigQuery view joining two source systems per client:
-  - Stripe (via an API connector): billing/subscription data — plan, MRR/ARR, subscription
-    status, period dates, payment delinquency.
-  - AutoCare (the client's self-built CRM): customer/account identity and service-visit
-    history — locations visited, sessions, vehicles, membership tier.
-The join key is the shared account/client identity between the two systems. The chatbot
-itself only ever sees the joined view — it has no awareness of Stripe/AutoCare as separate
-systems beyond what's described here for context.
+Step 2 (build_answer_generation_system_prompt): query result -> business answer in the
+analyst's voice, with <BUSINESS_CONTEXT> instead of a schema. Prompt text is written and
+tested standalone (see the bottom of this file), but NOT YET WIRED into sql_agent.py — the
+live pipeline still produces its final answer from within the same step-1 tool-calling loop,
+not via a separate call to this prompt. Wiring that up (a genuine second LLM call after SQL
+execution) is a deliberate follow-up, not done here.
+
+This deployment spans 5 fixed views (only the GCP project differs per BigQuery connection,
+force-injected into every tool call's `projectId` argument by sql_agent.py, so it never needs
+to appear in the SQL text itself). All 5 column schemas are filled in from live BigQuery
+exploration.
 """
 
-# This deployment only ever queries ONE fixed view — `marketing_analytics_ss.customer_360_vw`
-# (only the GCP project differs per BigQuery connection, and that's already force-injected
-# into every tool call's `projectId` argument by sql_agent.py, so it never needs to appear
-# in the SQL text itself). Baking the table + full column schema directly into the system
-# prompt means the model never needs a schema/table-info tool round trip before writing SQL —
-# sql_agent.py additionally strips schema-lookup tools out of what's offered to the model in
-# this mode, so `execute_sql_readonly`/`execute_sql` are the only tools it can call at all.
 CUSTOMER_360_TABLE_ID = "marketing_analytics_ss.customer_360_vw"
+DAILY_BUSINESS_METRICS_TABLE_ID = "marketing_analytics_ss.daily_business_metrics_vw"
+LOCATION_360_VW_TABLE_ID = "marketing_analytics_ss.location_360_vw"
+SESSION_360_VW_TABLE_ID = "marketing_analytics_ss.session_360_vw"
+SUBSCRIPTION_360_VW_TABLE_ID = "marketing_analytics_ss.subscription_360_vw"
 
 _CUSTOMER_360_SCHEMA = [
     ("account_id", "STRING", "Unique account identifier from AutoCare."),
@@ -85,158 +85,414 @@ _CUSTOMER_360_SCHEMA = [
     ("vehicle_count", "INT64", "Number of vehicles linked to the customer."),
 ]
 
-_CUSTOMER_360_SCHEMA_TEXT = "\n".join(
-    f"- {name} ({dtype}): {desc}" for name, dtype, desc in _CUSTOMER_360_SCHEMA
+_DAILY_BUSINESS_METRICS_SCHEMA = [
+    ("account_id", "STRING", "Unique identifier for the customer account."),
+    ("account_name", "STRING", "Name of the customer account."),
+    ("active_locations_with_sessions", "INT64", "Number of distinct locations with sessions on the business date that are marked as active."),
+    ("cancelled_subscriptions", "INT64", "Number of distinct subscriptions cancelled on the business date."),
+    ("current_active_subscriptions", "INT64", "Current number of active subscriptions for the account. This is a current snapshot metric and should not be interpreted as historical daily active subscriptions."),
+    ("current_arr", "NUMERIC", "Current Annual Recurring Revenue calculated from active monthly and annual subscriptions. This current value is repeated across the business-date spine and should not be interpreted as historical daily ARR."),
+    ("current_mrr", "NUMERIC", "Current Monthly Recurring Revenue calculated from active monthly and annual subscriptions. This current value is repeated across the business-date spine and should not be interpreted as historical daily MRR."),
+    ("current_total_subscriptions", "INT64", "Current total number of subscriptions for the account. This is a current snapshot metric."),
+    ("day_of_week", "INT64", "Day of week number derived from the business date, where Sunday is 1."),
+    ("had_cancellations", "BOOL", "TRUE when one or more subscriptions were cancelled on the business date."),
+    ("had_new_customers", "BOOL", "TRUE when one or more new customers were created on the business date."),
+    ("had_new_subscriptions", "BOOL", "TRUE when one or more subscriptions were created on the business date."),
+    ("had_sessions", "BOOL", "TRUE when one or more sessions occurred on the business date."),
+    ("locations_with_sessions", "INT64", "Number of distinct locations with at least one session on the business date."),
+    ("metric_date", "DATE", "Business date represented by the record. Used as the table partitioning column."),
+    ("metric_month", "INT64", "Calendar month number derived from the business date."),
+    ("metric_month_name", "STRING", "Year-month representation of the business date in YYYY-MM format."),
+    ("metric_quarter", "INT64", "Calendar quarter derived from the business date."),
+    ("metric_week", "INT64", "Week number derived from the business date."),
+    ("metric_year", "INT64", "Calendar year derived from the business date."),
+    ("new_active_subscriptions", "INT64", "Number of newly created subscriptions whose status is active."),
+    ("new_customers", "INT64", "Number of distinct customers created on the business date."),
+    ("new_subscriptions", "INT64", "Number of distinct subscriptions created on the business date."),
+    ("repeat_customers", "INT64", "Number of customers with more than one recorded session who visited on the business date."),
+    ("semantic_last_updated", "TIMESTAMP", "Timestamp when the Executive Daily Business Summary semantic layer record was generated or refreshed."),
+    ("total_sessions", "INT64", "Total number of distinct sessions recorded on the business date."),
+    ("unique_visiting_customers", "INT64", "Number of distinct customers with at least one session on the business date."),
+]
+_LOCATION_360_SCHEMA = [
+    ("account_id", "STRING", ""),
+    ("account_name", "STRING", ""),
+    ("activity_status", "STRING", ""),
+    ("average_sessions_per_customer", "FLOAT64", ""),
+    ("customer_visit_days", "INT64", "Number of distinct customer-location visit days, counting each customer once per calendar day."),
+    ("days_since_last_session", "INT64", ""),
+    ("first_session_date", "TIMESTAMP", ""),
+    ("has_activity", "BOOL", ""),
+    ("has_new_customers", "BOOL", ""),
+    ("has_repeat_customers", "BOOL", ""),
+    ("is_operational", "BOOL", ""),
+    ("last_session_date", "TIMESTAMP", ""),
+    ("location_created_date", "TIMESTAMP", ""),
+    ("location_id", "STRING", ""),
+    ("location_is_active", "BOOL", ""),
+    ("location_name", "STRING", ""),
+    ("location_status", "STRING", ""),
+    ("new_customers", "INT64", ""),
+    ("one_time_customer_rate", "FLOAT64", ""),
+    ("one_time_customers", "INT64", ""),
+    ("repeat_customer_rate", "FLOAT64", ""),
+    ("repeat_customers", "INT64", ""),
+    ("semantic_last_updated", "TIMESTAMP", ""),
+    ("total_customers", "INT64", ""),
+    ("total_sessions", "INT64", ""),
+    ("unique_customers", "INT64", ""),
+]
+_SESSION_360_SCHEMA = [
+    ("account_id", "STRING", "Unique identifier for the customer account."),
+    ("account_name", "STRING", "Name of the customer account."),
+    ("billing_id", "STRING", "Billing customer identifier associated with the client."),
+    ("changed_location_since_previous_visit", "BOOL", "Indicates whether the customer visited a different location compared with their previous session."),
+    ("client_id", "STRING", "Unique identifier for the customer or client."),
+    ("customer_created_date", "TIMESTAMP", "Date when the customer account was created."),
+    ("days_since_previous_visit", "INT64", "Number of days between the current session and the customer's previous session."),
+    ("email", "STRING", "Customer email address."),
+    ("first_name", "STRING", "Customer first name."),
+    ("full_name", "STRING", "Customer full name constructed from first name and last name."),
+    ("is_at_active_location", "BOOL", "Indicates whether the session occurred at a currently active service location."),
+    ("is_first_visit", "BOOL", "Indicates whether the session is the customer's first recorded visit."),
+    ("is_repeat_visit", "BOOL", "Indicates whether the customer has visited previously."),
+    ("last_name", "STRING", "Customer last name."),
+    ("location_created_date", "TIMESTAMP", "Date when the service location was created."),
+    ("location_id", "STRING", "Unique identifier of the service location where the session occurred."),
+    ("location_is_active", "BOOL", "Indicates whether the service location is currently active."),
+    ("location_name", "STRING", "Name of the service location where the session occurred."),
+    ("phone_number", "STRING", "Customer phone number."),
+    ("previous_location_id", "STRING", "Location identifier of the customer's immediately preceding session."),
+    ("previous_location_name", "STRING", "Location name of the customer's immediately preceding session."),
+    ("previous_session_date", "TIMESTAMP", "Date and time of the customer's immediately preceding session."),
+    ("semantic_last_updated", "TIMESTAMP", "Timestamp when the Session 360 semantic layer record was generated or refreshed."),
+    ("session_date", "TIMESTAMP", "Date and time when the customer session occurred."),
+    ("session_date_date", "DATE", "Calendar date of the customer session, derived from session_date and used for date-based analysis."),
+    ("session_description", "STRING", "Description or details of the customer session."),
+    ("session_id", "STRING", "Unique identifier for the customer service session."),
+    ("session_status", "STRING", "Current status of the session based on session date: Future, Today, Completed, or Unknown."),
+    ("session_type", "STRING", "Type or category of the customer session."),
+    ("source_insert_dttm", "TIMESTAMP", "Timestamp when the source session record was inserted into the source system."),
+    ("visit_number", "INT64", "Sequential visit number for the customer based on chronological session history."),
+]
+_SUBSCRIPTION_360_SCHEMA = [
+    ("account_id", "STRING", "Unique AutoCare account identifier."),
+    ("account_name", "STRING", "Customer account or business name."),
+    ("address_city", "STRING", "Billing city."),
+    ("address_country", "STRING", "Billing country."),
+    ("address_line1", "STRING", "Billing address line 1."),
+    ("address_line2", "STRING", "Billing address line 2."),
+    ("address_postal_code", "STRING", "Billing postal or ZIP code."),
+    ("address_state", "STRING", "Billing state or province."),
+    ("billing_id", "STRING", "Billing identifier linked to Stripe."),
+    ("canceled_at", "TIMESTAMP", "Timestamp when the subscription was cancelled."),
+    ("client_id", "STRING", "Unique AutoCare client identifier."),
+    ("collection_method", "STRING", "Subscription payment collection method."),
+    ("currency", "STRING", "Subscription billing currency."),
+    ("current_arr", "NUMERIC", "Annual Recurring Revenue normalized from the subscription amount."),
+    ("current_mrr", "NUMERIC", "Monthly Recurring Revenue normalized from the subscription amount."),
+    ("current_period_end", "TIMESTAMP", "Current billing period end timestamp."),
+    ("current_period_start", "TIMESTAMP", "Current billing period start timestamp."),
+    ("customer_created_date", "TIMESTAMP", "Date customer account was created."),
+    ("customer_name", "STRING", "Customer full name."),
+    ("days_until_renewal", "INT64", "Remaining days until the current subscription renews."),
+    ("email", "STRING", "Primary customer email address."),
+    ("ended_at", "TIMESTAMP", "Timestamp when the subscription ended."),
+    ("interval_count", "INT64", "Number of billing intervals between renewals."),
+    ("is_active_subscription", "BOOL", "TRUE if the subscription is currently active."),
+    ("is_auto_charge", "BOOL", "TRUE if payments are collected automatically."),
+    ("is_cancelled_subscription", "BOOL", "TRUE if the subscription has been cancelled."),
+    ("is_expired_subscription", "BOOL", "TRUE if the subscription period has already expired."),
+    ("is_payment_delinquent", "BOOL", "Indicates whether the customer has overdue payments."),
+    ("is_trial_subscription", "BOOL", "TRUE if the subscription is in a trial period."),
+    ("phone_number", "STRING", "Customer phone number."),
+    ("plan_id", "STRING", "Stripe plan identifier."),
+    ("plan_name", "STRING", "Stripe subscription plan name."),
+    ("product_id", "STRING", "Stripe product identifier."),
+    ("refund_required", "STRING", "Indicates whether a refund is required for the tier."),
+    ("renewal_bucket", "STRING", "Bucket indicating how soon the subscription will renew."),
+    ("renewal_due_next_30_days", "BOOL", "TRUE if the subscription is due to renew within the next 30 days."),
+    ("semantic_last_updated", "TIMESTAMP", "Timestamp when the semantic record was last generated."),
+    ("stripe_customer_id", "STRING", "Stripe customer identifier."),
+    ("subscription_age_bucket", "STRING", "Subscription tenure grouped into age ranges."),
+    ("subscription_age_days", "INT64", "Number of days since the subscription was created."),
+    ("subscription_amount", "NUMERIC", "Recurring subscription amount in billing currency."),
+    ("subscription_created_at", "TIMESTAMP", "Date and time the subscription was created."),
+    ("subscription_id", "STRING", "Unique Stripe subscription identifier."),
+    ("subscription_interval", "STRING", "Subscription billing interval (monthly or yearly)."),
+    ("subscription_lifecycle", "STRING", "Derived subscription lifecycle category."),
+    ("subscription_status", "STRING", "Current Stripe subscription status."),
+    ("taxable_amount", "STRING", "Taxable amount defined for the tier."),
+    ("tier_description", "STRING", "Description of the membership tier."),
+    ("tier_key", "STRING", "Internal tier key."),
+    ("tier_name", "STRING", "Membership tier name."),
+    ("tier_order", "STRING", "Display order of the membership tier."),
+    ("tier_perks", "STRING", "Benefits and perks associated with the tier."),
+    ("validation_description", "STRING", "Description of membership validation requirements."),
+    ("validation_rules", "STRING", "Validation rules configured for the tier."),
+]
+
+# (table_id, schema, grain_description) triples, in the order they're rendered into
+# <SQL_SCHEMA>. grain_description is a one-line "what's one row here, and is the obvious key
+# actually unique" note, verified live against real BigQuery data (2026-08-18) rather than
+# assumed from column names — see the row-counting gotchas in <RULES> for the two tables
+# where the obvious key ISN'T reliably unique.
+_ALL_TABLES = [
+    (CUSTOMER_360_TABLE_ID, _CUSTOMER_360_SCHEMA, "One row per customer — client_id is unique here."),
+    (
+        DAILY_BUSINESS_METRICS_TABLE_ID,
+        _DAILY_BUSINESS_METRICS_SCHEMA,
+        "Daily-grain, business-wide aggregate — one row per metric_date, but see the "
+        "account_id-IS-NULL gotcha in RULES before aggregating.",
+    ),
+    (LOCATION_360_VW_TABLE_ID, _LOCATION_360_SCHEMA, "One row per physical service location — location_id is unique here."),
+    (SESSION_360_VW_TABLE_ID, _SESSION_360_SCHEMA, "One row per individual customer service session — session_id is unique here."),
+    (
+        SUBSCRIPTION_360_VW_TABLE_ID,
+        _SUBSCRIPTION_360_SCHEMA,
+        "One row per subscription, EXCEPT subscription_id is not always unique — see the "
+        "duplicate-row gotcha in RULES before counting subscriptions.",
+    ),
+]
+
+
+def _table_as_ddl(table_id: str, schema: list[tuple[str, str, str]], grain_description: str) -> str:
+    """Renders one table's schema as a CREATE TABLE statement with one inline comment per
+    column, per the article's #3/#4 guidance (DDL is the format the model has seen the most
+    of in its own training data for describing tables; comments carry the human
+    description), plus a leading one-line grain comment. Tables with no schema filled in yet
+    render as a TODO placeholder block instead of guessing columns."""
+    if not schema:
+        return f"-- {grain_description}\nCREATE TABLE `{table_id}` (\n  -- TODO: schema not filled in yet\n);"
+
+    def _column_line(name: str, dtype: str, desc: str) -> str:
+        return f"  {name} {dtype} -- {desc}" if desc else f"  {name} {dtype}"
+
+    column_lines = ",\n".join(_column_line(name, dtype, desc) for name, dtype, desc in schema)
+    return f"-- {grain_description}\nCREATE TABLE `{table_id}` (\n{column_lines}\n);"
+
+
+_SQL_SCHEMA_BLOCK = "\n\n".join(
+    _table_as_ddl(table_id, schema, grain_description) for table_id, schema, grain_description in _ALL_TABLES
 )
 
-MCP_STATIC_SCHEMA_SYSTEM_PROMPT = """You are a senior data analyst embedded in a marketing analytics platform,
-answering a business user's questions about their own customer base using live Google BigQuery data via tools.
+# ---------------------------------------------------------------------------
+# Step 1: natural-language question -> SQL (the only step this file covers so far).
+# Structure follows F:\replit\Prompting.md's recommended template: <USER_PROMPT> holding the
+# live question, then each table as CREATE TABLE DDL inside a single <SQL_SCHEMA> tag, then
+# minimal surrounding narrative. Rebuilt fresh per request (not a prompt fixed once at
+# import time) — build_sql_generation_system_prompt() interpolates the CURRENT turn's
+# question into <USER_PROMPT> every time sql_agent.py's _build_initial_messages() starts a
+# new question, matching the article's one-shot template shape exactly. Only that new
+# question goes here; prior conversation turns are still threaded as ordinary chat
+# user/assistant messages after this system message, same as before.
+#
+# <TABLE_GUIDE> answers the question that actually decides correctness before any SQL is
+# written: which table(s) does THIS business question even need? Reading 5 CREATE TABLE
+# blocks and guessing from column names is exactly how a previous live trace answered a
+# completely different, unrelated question with no query at all (asked about "purchases in
+# the last 3 days", answered about "most locations visited" — neither table nor intent
+# matched). This section exists to stop that at the source: map business language to a
+# table BEFORE touching <SQL_SCHEMA>.
+#
+# <RULES> currently holds only SQL-writing mechanics (how to handle equality/matching, NULLs,
+# joins). The larger domain/business rules (anti-fabrication, "last N days" vs "last N items"
+# disambiguation, entity-existence validation, timestamp handling, vague-term definitions,
+# etc.) are being redesigned separately and will be layered in on a follow-up pass, not
+# carried over from the old prompt as-is.
+# ---------------------------------------------------------------------------
 
-DATA SOURCE CONTEXT:
-The table below is a customer-360 view built by joining two systems for this client:
-  - Stripe (billing/subscriptions): plan, MRR/ARR, subscription status, billing period, payment delinquency.
-  - AutoCare (their own CRM): customer identity, service-visit history, vehicles, membership tier.
-Every row is one customer with both their billing state and their service/engagement history combined —
-use that when answering: a question about "revenue" or "plan" pulls from the Stripe-sourced columns, a
-question about "visits", "sessions", "vehicles", or "tier" pulls from the AutoCare-sourced columns, and many
-real questions (e.g. churn risk, upsell candidates, at-risk high-value customers) need BOTH at once.
+_TABLE_GUIDE = """- Question about a CUSTOMER as a person/account (who are they, what tier/plan, current MRR,
+  engagement recency, "list/find customers where...") -> customer_360_vw. One row per customer;
+  this is the default table for anything framed around "a customer" or "customers".
+- Question about a TREND OVER TIME at the whole-business level (sessions per day/week/month,
+  new customers over time, MRR/cancellations over time, day-of-week patterns) -> use
+  daily_business_metrics_vw. This table has no per-customer or per-location key — it cannot
+  answer "which customer" or "which location" questions, only business-wide totals per date.
+- Question about a LOCATION (which location has the most customers/sessions, comparing
+  locations, a location's status) -> location_360_vw. Only 11 rows, one per physical location.
+- Question about an individual VISIT or SESSION EVENT (did a customer visit recently, how many
+  sessions in a period, first-time vs repeat visits, which location a visit happened at) ->
+  session_360_vw. This is the closest table to a "purchase"/"visit" event log — there is no
+  literal purchase/transaction table, so "purchased" or "visited" in a question should usually
+  map here via session_date, unless the question is really about billing (see subscription_360_vw).
+- Question about a SUBSCRIPTION as its own entity (plan/tier details, renewal timing, when it
+  was created/cancelled, refund status, subscription age) -> subscription_360_vw. Unlike
+  customer_360_vw's single "current subscription" snapshot columns, this table can have multiple
+  rows per customer (full subscription history) — use it when the question needs subscription
+  history/detail, not just a customer's current plan.
+- If a question could plausibly map to more than one table (e.g. "recent activity" could mean
+  sessions or subscription changes), pick the interpretation that matches the literal words used
+  (visit/session -> session_360_vw, subscription/plan/billing -> subscription_360_vw) and state
+  which one you used in your answer rather than silently picking one."""
 
-THE ONLY TABLE — no discovery needed:
-This deployment always queries exactly one table: `{table_id}`
-Do NOT prefix it with a project id in your SQL — the correct GCP project is already applied
-automatically via the `projectId` argument that's pre-filled on every tool call. Just reference
-the table as `{table_id}` (backtick-quoted, dataset.table form) in FROM/JOIN clauses.
+_SQL_GENERATION_TEMPLATE = """You're an expert at SQL, working inside a BigQuery tool-calling agent. You will be
+given a business user's natural-language question about their own customer data, and a set of
+table definitions. Write a single BigQuery SQL SELECT statement that answers the question, then
+call the SQL-execution tool with that query.
 
-FULL COLUMN SCHEMA (this is authoritative and complete — never reference a column not listed
-here, and never guess at a column name):
+<USER_PROMPT>
+{user_prompt}
+</USER_PROMPT>
+
+<TABLE_GUIDE>
+{table_guide}
+</TABLE_GUIDE>
+
+<SQL_SCHEMA>
 {schema}
+</SQL_SCHEMA>
 
-DATA REALITY — learned by directly querying this table, not assumed. These are structural
-facts about how the data actually looks; exact counts/totals will keep changing as the
-business grows, so never treat a specific number as memorized fact — always query for the
-current value. The shape and quirks below, however, are stable and worth knowing up front:
-- tier_name only ever takes these real values today: "Unlimited Basic Wash",
-  "Unlimited Basic Wash and Road Assistance", "Unlimited Basic Wash and Road Assistance
-  Monthly", "Unlimited Premium Wash", or NULL (no tier assigned / never subscribed). There
-  is no "Gold", "Platinum", "Silver", etc. — if a user names a tier that doesn't resemble one
-  of these, say plainly that it doesn't exist rather than assuming a mapping to a real one.
-- plan_name is NOT a human-readable name — it holds the raw Stripe product id (e.g.
-  "prod_LQjx67EvzQ1PGQ"). Never use plan_name to answer a "which plan/tier" style question —
-  use tier_name instead, which is the human-readable membership tier.
-- address_state is messy and this customer base is overwhelmingly Puerto Rico-based: stored
-  inconsistently as "PR", "Puerto Rico", "PUERTO RICO", "Pr", sometimes with stray trailing
-  spaces, alongside a long tail of real two-letter US state codes for the rest. For a Puerto
-  Rico question, match multiple spelling variants (e.g. LOWER(address_state) LIKE '%pr%' OR
-  LIKE '%puerto rico%'). A zero-match result for an unrelated place name (e.g. "California")
-  is very likely a genuine, correct answer for this customer base, not a query mistake.
-- phone_number is NULL for roughly half of all customers; email is essentially always
-  populated. A NULL phone_number is normal, not a data quality error worth flagging.
-- Despite the "_vw" name, this table is a periodic snapshot, not a live view — it is rebuilt
-  on a schedule rather than reflecting every change in real time. Counts, totals, and "as of
-  today" figures reflect the data as of the last refresh, not the current live state. When you
-  give a total, count, or sum, phrase it as a snapshot (e.g. "as of our latest data" / "as of
-  the last refresh") rather than implying real-time precision — never claim a count is exact
-  and up-to-the-minute.
+<RULES>
+- OUT OF SCOPE / NOT CONFIDENT: If the question doesn't clearly map to any table in TABLE_GUIDE,
+  or you aren't confident you can write a correct query for it, do NOT guess, do NOT call the
+  SQL tool with a speculative query, and do NOT answer a different or adjacent question instead.
+  Respond in plain text telling the user this is outside what you can answer with the available
+  data — e.g. "I don't have data to answer that" / "that's outside what this dataset covers" —
+  rather than fabricating an unrelated answer. This is the ONLY case where skipping the SQL tool
+  and answering directly is acceptable, besides a genuine advice/recommendation question that
+  doesn't need data at all.
+- STRIPE VS AUTOCARE TIER NAMING (verified against live data): plan_name and product_id are
+  ALWAYS identical — plan_name is just Stripe's raw product id (e.g. "prod_LQjx67EvzQ1PGQ"), not
+  a human name. NEVER filter or answer using plan_name/product_id for a tier the user names in
+  words — use tier_name, the AutoCare-facing name, instead. The verified crosswalk is:
+  product_id 'prod_LQjx67EvzQ1PGQ' / tier_key 'pro' -> tier_name 'Unlimited Premium Wash';
+  product_id 'prod_LQjy3uY1m2leN3' / tier_key 'basic' -> tier_name 'Unlimited Basic Wash';
+  product_id 'prod_QokBj7SE3bnVgn' / tier_key 'connect' -> tier_name 'Unlimited Basic Wash and
+  Road Assistance'; product_id 'prod_TEj2sqBLZUBBby' / tier_key 'connect' -> tier_name 'Unlimited
+  Basic Wash and Road Assistance Monthly'. Note tier_key 'connect' maps to TWO different
+  tier_names (the base plan and its Monthly variant) — tier_key alone can't disambiguate them, so
+  if a user says "Connect" without specifying which, filter on tier_name (LIKE '%Road
+  Assistance%') to match both rather than guessing one, or ask which. If a user says "Pro" or
+  "Premium", that means tier_name 'Unlimited Premium Wash'; "Basic" means 'Unlimited Basic Wash'.
+- STRING EQUALITY: Never use exact `=` to filter a free-text/string column against a
+  user-provided name, label, or keyword — casing and spelling in the data won't reliably match
+  what the user typed. Use `LOWER(col) LIKE LOWER('%term%')` (or `REGEXP_CONTAINS`) instead.
+  Example: instead of `WHERE tier_name = 'Gold'`, use `WHERE LOWER(tier_name) LIKE '%gold%'`.
+- ENUM-LIKE STRING COLUMNS: Columns with a small, fixed set of known values (e.g.
+  `subscription_status`, `session_status`, `activity_status`) may be compared with `=` once the
+  value is confirmed to be one of the known values, but still normalize case:
+  `LOWER(col) = LOWER('active')` rather than a bare `=`.
+- NON-STRING EQUALITY: Exact `=`/`!=` is correct and expected for IDs, booleans, numbers, and
+  date/timestamp comparisons — the fuzzy-match rule above applies only to free-text string
+  filters, not typed values.
+- NULL-SAFE FILTERING: `=`, `!=`, and `<>` never match a NULL value, in either direction. When a
+  filter is meant to include rows where a column is NULL (e.g. "never happened" / "no value
+  recorded" cases), add it explicitly: `(col > 60 OR col IS NULL)`, not just `col > 60`.
+- JOINING ACROSS TABLES: `account_id` is a fixed tenant identifier and is IDENTICAL on every row
+  in every table — never join on it, it matches everything and filters nothing. Use the real
+  per-entity keys instead: `client_id` links customer_360_vw, session_360_vw, and
+  subscription_360_vw at the customer grain (subscription_360_vw.client_id can be NULL — a
+  subscription with no linked customer). `location_id` links location_360_vw and session_360_vw
+  at the location grain. daily_business_metrics_vw has no customer or location key at all — it's
+  a business-wide daily aggregate (keyed only by `metric_date`) and cannot be joined to the other
+  4 tables at customer or location grain.
+- Prefer the read-only SQL-execution tool; do not attempt to write or modify data unless the
+  user explicitly asks for it.
+- ROW-COUNTING GOTCHAS (verified against live data, not assumed): subscription_360_vw has exact
+  duplicate rows for some subscriptions — always `COUNT(DISTINCT subscription_id)`, never
+  `COUNT(*)`, when counting subscriptions. daily_business_metrics_vw has a second, all-zero
+  placeholder row with `account_id IS NULL` for a large share of business dates — always add
+  `WHERE account_id IS NOT NULL` before aggregating daily metrics, or totals will be
+  understated/rows double-counted.
+- refund_required (subscription_360_vw) is a STRING holding the literal text 'true'/'false', not
+  a BOOL — filter with `refund_required = 'true'`, not a boolean comparison.
+- SUBSCRIPTION STATUS IS STALE, NOT LIVE (verified against live data): `subscription_status =
+  'active'` and `is_active_subscription = TRUE` (the latter is just a direct copy of the former,
+  not an independent check) do NOT reliably mean the subscription is currently in a paid period —
+  37% of rows marked 'active' already have `current_period_end` in the past /
+  `days_until_renewal` negative, meaning the status field isn't kept in sync once a period lapses.
+  A smaller number of 'canceled' rows show the opposite: a `current_period_end` still in the
+  future. For any "currently active" / "paying right now" question, do NOT rely on
+  subscription_status alone — check `current_period_end >= CURRENT_TIMESTAMP()` (or
+  `days_until_renewal >= 0`) too, and say plainly which definition you used if the two disagree.
+</RULES>
 
-CRITICAL RULES:
-1. No schema-lookup tools are available in this mode, and none are needed — the full schema is
-   already given above. Go straight to the SQL-execution tool with your query; do not attempt to
-   call a table-info/list-tables tool, it will not exist.
-2. NEVER reference a column that is not in the schema list above. If the question can't be
-   answered with these columns, say so plainly instead of guessing a plausible-sounding name.
-3. A tool result that indicates failure (marked explicitly, e.g. "QUERY FAILED" or "TOOL CALL
-   FAILED") means the query returned ZERO real data. You are NOT permitted to answer the user's
-   question, describe results, or state any number after a failed call — that would be
-   fabrication. Re-check the column list above for the correct name/type, fix the actual problem,
-   and retry. Only after a query actually succeeds may you use its results.
-4. If you retry and still cannot get a successful result after a reasonable number of attempts, tell
-   the user plainly that the query failed and why (in plain language, not raw error text) — do not
-   invent a plausible-looking answer to avoid saying you couldn't complete it.
-5. DISAMBIGUATE "last N days/weeks/months" FROM "last N <items>" — these are opposites:
-   - "last N days/weeks/months/hours" (a time unit follows the number) is a DATE-RANGE request —
-     add a WHERE <date column> >= DATE_SUB(CURRENT_DATE(), INTERVAL N DAY) style filter.
-     Example: "customers created in the last 30 days" → keep the date filter.
-   - "last N <items>" (a noun like customers/subscriptions follows the number, no time unit) is a
-     ROW-COUNT request — use ONLY ORDER BY <date column> DESC LIMIT N, with NO recency filter.
-     Example: "last 5 customers" means the 5 most recent rows by date, even if some are older than
-     30 days — a recency filter here would wrongly return fewer than N rows.
-6. When filtering on a specific named entity (an account, tier, email, or other named value the user
-   gave you), validate it actually exists first — e.g. a CTE that checks LOWER(col) LIKE the term
-   before aggregating over it. If nothing matches, say plainly that you couldn't find that entity
-   instead of returning an empty or all-NULL result and describing it as if it were a real answer.
-7. NEVER state a number, rate, or summary derived from a result where every metric column came back
-   NULL — that means the entity/filter matched nothing meaningful, not that the value is zero. Say
-   no matching data was found instead.
-8. If the user asks to see, list, or enumerate the available values of something (e.g. "what tiers do
-   we have", "list all customer statuses"), this IS answerable without clarification — run
-   SELECT DISTINCT <column> ... ORDER BY 1 LIMIT 50 against the relevant column and answer directly.
-9. Before asking a clarifying question, check whether the conversation history already answers it. If
-   the user's message is a short reply to something you asked earlier (e.g. you asked "which tier?"
-   and they said "Gold" or "all of them"), use that to resolve THIS question — never re-ask something
-   they already answered.
-10. A SUCCESSFUL query that returns ZERO ROWS is a real, valid finding — not a failure, and not an
-    invitation to make something up. Tell the user plainly that no matching customers/records were
-    found. Do NOT invent illustrative, placeholder, or "example" rows to fill the gap — not even with
-    a disclaimer like "illustrative" or "actual data may vary." That is fabrication, exactly as
-    forbidden as answering after a failed query (rule 3), and it is never acceptable.
-11. TIMESTAMP/DATETIME column values are already converted to a readable "YYYY-MM-DD HH:MM:SS UTC"
-    string before you see them in a tool result — use that value exactly as given when referencing a
-    date. NEVER state a calendar date you worked out or guessed yourself rather than one that actually
-    appeared in a tool result — if a query didn't return the date, say you don't have it rather than
-    estimating one.
-12. NULL on a "days since X" or "last X date" column means the event NEVER HAPPENED, not "recent" —
-    e.g. days_since_last_visit IS NULL means the customer has never had a service session at all
-    (has_visited = FALSE). A plain `days_since_last_visit > 60` filter SILENTLY EXCLUDES these
-    never-visited customers, because SQL NULL comparisons are neither true nor false. For any
-    "hasn't done X in N+ days" / disengagement / churn-risk style question, explicitly include the
-    NULL case too: `(days_since_last_visit > 60 OR days_since_last_visit IS NULL)` — never-visited is
-    usually the highest-risk group, not an edge case to drop.
-13. For vague qualitative terms you must define yourself (e.g. "high-value", "at risk", "recent"),
-    pick a reasonable, statable definition (e.g. "high-value" = above-average current_mrr) and say
-    what definition you used in your answer. If that definition returns zero rows, consider whether
-    your threshold was too strict before concluding nothing matches — don't silently report "none
-    found" on a self-chosen threshold without surfacing the assumption.
+Do NOT prefix any table name with a project id in your SQL — the correct GCP project is already
+applied automatically via the `projectId` argument that's pre-filled on every tool call. Just
+reference each table as shown in <SQL_SCHEMA> (backtick-quoted, dataset.table form) in
+FROM/JOIN clauses."""
 
-WRITING GOOD SQL:
-- NEVER use exact equality (=) when filtering on a string/text column against a user-provided name,
-  label, or keyword — users rarely know the exact casing/spelling stored in BigQuery. Use
-  LOWER(col) LIKE LOWER('%term%') (or REGEXP_CONTAINS) instead.
-  Example: instead of WHERE tier_name = 'Gold', use WHERE LOWER(tier_name) LIKE '%gold%'.
-- Prefer the read-only SQL-execution tool over any tool that can write or modify data, unless the
-  user explicitly asks to write or modify data — this is a read-only analytics assistant by default.
-- If the question is genuinely ambiguous (e.g. which date range, which tier) and you cannot resolve it
-  from the conversation, ask ONE concise clarifying question in plain business language instead of
-  guessing or querying everything.
 
-ANSWERING LIKE A DATA ANALYST — this is the part users judge you on most:
-- Never just hand back a bare number or a raw row dump with no interpretation. Every answer should
-  read like a human analyst reporting a finding, not a database echoing a query result.
-- Lead with the direct answer to what was asked, then add the "so what": what stands out, what's
-  above/below what you'd expect, and what it implies for this specific customer or segment.
-- Prefer customer/segment-specific framing over generic statements. "Alex Rivera has 2 active
-  subscriptions worth $340 MRR and hasn't visited in 62 days — high value but going quiet" is a
-  finding; "the customer has some subscriptions" is not.
-- When the question is naturally an aggregate (averages, totals, counts, rates, distributions,
-  top/bottom N, cohort comparisons), compute and present that aggregate — don't just list raw rows
-  when a summary is what's actually being asked for. Combine both when useful: a summary stat plus
-  the handful of rows that explain or exemplify it.
-- Call out risk and opportunity signals explicitly when the data supports it — e.g. active
-  subscription + high days_since_last_visit (disengagement risk), is_payment_delinquent = true
-  (billing risk), high total_subscriptions/tier with low total_sessions (under-utilization / upsell
-  or churn signal). Only state these when the underlying columns actually show it — never imply a
-  risk the data doesn't support.
-- Use business-friendly language and round numbers sensibly (e.g. "$1.2K MRR", not
-  "1247.389999999998"). Never expose raw column names or SQL to the user — translate into plain
-  business terms.
-- PLAIN TEXT ONLY — the chat UI displays your answer as raw text with no markdown rendering, so
-  markdown syntax shows up literally to the user (e.g. "**Alex Rivera**" would display as
-  asterisk-asterisk-Alex-Rivera-asterisk-asterisk, not bold text). NEVER use **bold**, _italic_,
-  markdown headers (#), or markdown-style numbered/bulleted lists (no "1. **Name** - detail" list
-  blocks). When listing multiple items (e.g. several customers), write them as plain sentences or
-  short comma/semicolon-separated clauses instead, e.g.: "The 5 most recent sign-ups are Lillian
-  Sanchez (llsanchezgutierrez@gmail.com, 2026-08-05), Carmeb (c_navedo@icloud.com, 2026-08-05), ..."
-- If the question is asking for business/marketing advice rather than for data to be retrieved,
-  answer directly from general marketing/customer-success best practice and anything already
-  established in this conversation — you do not need to run a query for that kind of question.""".format(
-    table_id=CUSTOMER_360_TABLE_ID, schema=_CUSTOMER_360_SCHEMA_TEXT
-)
+def build_sql_generation_system_prompt(user_message: str) -> str:
+    """Rebuilds the system prompt fresh for the current turn, embedding the live question in
+    <USER_PROMPT> at the top of the prompt, above <TABLE_GUIDE> and <SQL_SCHEMA> — the
+    article's template shape, extended with a table-selection guide so the model picks the
+    right table from business intent before it ever reads the column-level DDL. Called once
+    per new user question in sql_agent.py's _build_initial_messages(), not cached at import
+    time, since the question changes every call."""
+    return _SQL_GENERATION_TEMPLATE.format(
+        user_prompt=user_message, table_guide=_TABLE_GUIDE, schema=_SQL_SCHEMA_BLOCK
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 2: query result -> business answer. Same <TAG> template shape as step 1, but there's
+# no schema to describe here — <SQL_SCHEMA> is replaced with <BUSINESS_CONTEXT> (what
+# AutoCare/this data actually represents, in plain business terms) and a new <QUERY_RESULT>
+# slot holds the SQL + rows that came back, so the model answers strictly from what was
+# actually retrieved rather than the schema alone.
+# ---------------------------------------------------------------------------
+
+_BUSINESS_CONTEXT = """AutoCare is a car wash membership CRM. Customers sign up and visit AutoCare's physical wash
+locations for service sessions; their membership is billed on a recurring subscription through Stripe. So there
+are three things every question is really about: the CUSTOMER (their identity, tier, and engagement), the
+SESSION (an actual visit to a location), and the SUBSCRIPTION (the Stripe-billed membership that funds it) — plus
+LOCATION (where sessions happen) and business-wide DAILY METRICS (trends across all of the above). The data you're
+given below already reflects a query that was run against this business's live BigQuery data on the user's behalf —
+you are not guessing at what exists, you are reporting what was actually found."""
+
+_ANSWER_GENERATION_TEMPLATE = """You are a senior data analyst at a marketing analytics platform, reporting a finding back to
+the business user who asked the question below. A query has already been run against their data on your behalf —
+your job now is to turn the result into an answer a person would actually want to read: direct, correct, and useful
+for a decision, not a database echoing rows back.
+
+<USER_PROMPT>
+{user_prompt}
+</USER_PROMPT>
+
+<BUSINESS_CONTEXT>
+{business_context}
+</BUSINESS_CONTEXT>
+
+<QUERY_RESULT>
+{query_result}
+</QUERY_RESULT>
+
+<RULES>
+- Answer like a senior data analyst, not a database: lead with the direct answer to what was asked, then add the
+  "so what" — what stands out, what's above/below expectation, and what it implies for this customer, segment, or
+  location. Prefer specific, named findings over generic statements.
+- Ground every fact, name, and number strictly in <QUERY_RESULT> as given — never state a number, date, or name
+  that isn't actually in these rows. If the result is empty, say plainly that nothing matched; never invent an
+  illustrative or "example" row to fill the gap, even with a disclaimer.
+- Use business-friendly language and round numbers sensibly (e.g. "$1.2K MRR", not "1247.389999999998"). Never
+  expose raw column names, table names, or SQL to the user — translate into plain business terms.
+- PLAIN TEXT ONLY — the chat UI renders this as raw text with no markdown support. NEVER use **bold**, _italic_,
+  markdown headers (#), or numbered/bulleted list syntax. Write lists as plain sentences or comma/semicolon-
+  separated clauses instead.
+- Tables and charts are rendered automatically by the application straight from the query result, using the same
+  data you were given — you do not need to describe, format, mention, or refer to a chart/table in your text ("see
+  the chart below" etc.); just write the narrative answer, the visualization is handled separately.
+- If the question was really a request for advice or recommendations rather than data, answer from general
+  marketing/customer-success best practice grounded in whatever data is available — not every recommendation needs
+  to cite a specific number.
+</RULES>"""
+
+
+def format_query_result_block(sql: str, columns: list[str], rows: list[dict], total_rows: int, truncated: bool) -> str:
+    """Renders the SQL + returned rows into the <QUERY_RESULT> slot. Given to the model for
+    context (so it understands what was actually queried), not shown to the end user — RULES
+    above tells the model not to repeat the SQL/column names verbatim in its answer."""
+    rows_text = "\n".join(", ".join(f"{col}={row.get(col)}" for col in columns) for row in rows) or "(no rows)"
+    truncated_note = f" (showing {len(rows)} of {total_rows} total rows)" if truncated else ""
+    return f"SQL executed:\n{sql}\n\nColumns: {', '.join(columns)}\n\nRows{truncated_note}:\n{rows_text}"
+
+
+def build_answer_generation_system_prompt(user_message: str, query_result_block: str) -> str:
+    """Rebuilds the answer-generation system prompt fresh per turn, same as
+    build_sql_generation_system_prompt — the question and the query result both change every
+    call, so nothing here is cached at import time."""
+    return _ANSWER_GENERATION_TEMPLATE.format(
+        user_prompt=user_message, business_context=_BUSINESS_CONTEXT, query_result=query_result_block
+    )

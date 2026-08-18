@@ -185,7 +185,8 @@ def _done_event(billable: bool, confidence: float, tables_used: list[str]) -> di
 def _sql_only_tools(mcp_tools: list[dict]) -> list[dict]:
     """Strips schema/discovery tools (list_dataset_ids, get_table_info, ...) out of what's
     offered to the model. Safe only because this deployment's schema is static and baked
-    into MCP_STATIC_SCHEMA_SYSTEM_PROMPT — the model never needs to look anything up.
+    into the system prompt built by prompts.build_sql_generation_system_prompt() — the model
+    never needs to look anything up.
     Falls back to the full tool list if, for some reason, no SQL-execution tool is found
     (e.g. the hosted MCP server renames its tools), so the agent degrades gracefully
     instead of being left with zero usable tools."""
@@ -194,7 +195,9 @@ def _sql_only_tools(mcp_tools: list[dict]) -> list[dict]:
 
 
 def _build_initial_messages(conversation_history: list[dict] | None, message: str) -> list[dict]:
-    messages: list[dict] = [{"role": "system", "content": prompts.MCP_STATIC_SCHEMA_SYSTEM_PROMPT}]
+    messages: list[dict] = [
+        {"role": "system", "content": prompts.build_sql_generation_system_prompt(message)}
+    ]
     for turn in conversation_history or []:
         role = turn.get("role")
         content = turn.get("content")
