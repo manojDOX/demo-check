@@ -19,7 +19,6 @@ from app.modules.kpi import repo as kpi_repo
 from app.modules.team import repo as team_repo
 
 _HISTORY_LOAD_LIMIT = 5
-_HISTORY_ROWS_SAMPLE = 5
 
 
 # ---------------------------------------------------------------------------
@@ -87,32 +86,14 @@ async def _resolve_or_create_session(
     return session
 
 
-def _rows_summary_for_history(rows_payload: dict) -> str | None:
-    data = rows_payload.get("data") or []
-    columns = rows_payload.get("columns") or []
-    if not data:
-        return None
-    lines = ["(internal context, not shown to the user — rows returned by the previous query):"]
-    for row in data[:_HISTORY_ROWS_SAMPLE]:
-        lines.append(", ".join(f"{col}={row.get(col)}" for col in columns))
-    total_rows = rows_payload.get("total_rows")
-    if total_rows is not None:
-        lines.append(f"(total_rows={total_rows})")
-    return "\n".join(lines)
-
-
 async def _load_history_from_db(db: AsyncSession, session_id: str) -> list[dict]:
+    """Threads only the question and the LLM's own narrative answer into the next request's
+    conversation history — never the SQL or query-result rows (those stay persisted on the
+    ChatMessage row itself for re-rendering a session's past turns in the UI, just not fed
+    back to the LLM as context)."""
     messages = await repo.get_messages(db, session_id)
     recent = messages[-_HISTORY_LOAD_LIMIT:]
-    history: list[dict] = []
-    for message in recent:
-        content = message.content
-        if message.role == "assistant" and message.rows:
-            summary = _rows_summary_for_history(message.rows)
-            if summary:
-                content = f"{content}\n\n{summary}"
-        history.append({"role": message.role, "content": content})
-    return history
+    return [{"role": message.role, "content": message.content} for message in recent]
 
 
 # ---------------------------------------------------------------------------
