@@ -8,9 +8,15 @@ Public interface (depended on by service.py / sql_agent.py):
 
     check_input_safety(message: str) -> tuple[bool, str | None]
     check_sql_safety(sql: str) -> tuple[bool, str | None]
+    check_join_conditions(sql: str) -> str | None
 
-Both return (is_safe, block_reason). `block_reason` is a short, human-readable string
-describing why the input/SQL was rejected; it is None when is_safe is True.
+The first two return (is_safe, block_reason); `block_reason` is a short, human-readable
+string describing why the input/SQL was rejected, None when is_safe is True.
+check_join_conditions is separate and retryable-by-design (unlike check_sql_safety's hard
+abort): it returns a reason string when a JOIN's ON clause looks like a filter/comparison
+instead of a key equality, or None when every JOIN looks fine. Callers should feed a non-None
+result back to the model as a retryable error (like a BigQuery tool error), not abort the
+whole turn — see sql_agent.py's call site.
 """
 
 from __future__ import annotations
@@ -190,6 +196,33 @@ _WRITE_DDL_KEYWORDS = (
 )
 
 _PROCEDURAL_KEYWORDS = ("BEGIN", "DECLARE", "LOOP")
+
+# Matches a `JOIN ... ON <condition>` clause, capturing the condition up to whatever comes
+# next (another JOIN, WHERE/GROUP/ORDER/LIMIT, or end of string). Deliberately narrow: this
+# only checks that the ON clause contains at least one top-level equality (`=`, not `==`/
+# `!=`), which is enough to catch a join condition that's actually a filter/comparison
+# predicate (e.g. `ON l.total_customers > 0`) — a real cartesian-join bug seen in practice —
+# without attempting to parse or validate general join correctness.
+_JOIN_ON_RE = re.compile(
+    r"\bJOIN\b.+?\bON\b\s*(.+?)(?=\bJOIN\b|\bWHERE\b|\bGROUP\s+BY\b|\bORDER\s+BY\b|\bLIMIT\b|\bQUALIFY\b|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+_EQUALITY_RE = re.compile(r"(?<![!<>=])=(?!=)")
+
+
+def check_join_conditions(sql: str) -> str | None:
+    for match in _JOIN_ON_RE.finditer(sql):
+        condition = match.group(1)
+        if not _EQUALITY_RE.search(condition):
+            return (
+                "Blocked: a JOIN's ON condition has no key-column equality (found: "
+                f"'{condition.strip()}'). A join condition must equate two of the documented "
+                "key columns (e.g. client_id = client_id, location_id = location_id) — a "
+                "filter/comparison predicate is not a valid join condition and produces a "
+                "cartesian/incorrect result. Re-check the documented table relationships and "
+                "retry, or don't join these tables if they don't share a key."
+            )
+    return None
 
 
 def check_sql_safety(sql: str) -> tuple[bool, str | None]:

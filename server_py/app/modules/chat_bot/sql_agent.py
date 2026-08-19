@@ -31,7 +31,12 @@ from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 
 from app.modules.chat_bot import guardrails, prompts
-from app.modules.chat_bot.config import CHATBOT_MAX_TOOL_RESULT_CHARS, CHATBOT_MAX_TOOL_ROUNDS
+from app.modules.chat_bot.config import (
+    CHATBOT_ANSWER_ROWS_SAMPLE,
+    CHATBOT_MAX_TOOL_RESULT_CHARS,
+    CHATBOT_MAX_TOOL_ROUNDS,
+    CHATBOT_TOOL_ECHO_ROW_SAMPLE,
+)
 from app.modules.chat_bot.llm_client import (
     call_llm_with_tools,
     mcp_tools_to_openai_format,
@@ -305,6 +310,7 @@ async def stream_single_query(
                 # different one — always use the connection's project_id.
                 arguments["projectId"] = connection.project_id
 
+                bad_join_reason: str | None = None
                 if _is_sql_tool(name):
                     sql = _extract_sql_from_arguments(arguments)
                     is_safe, unsafe_reason = guardrails.check_sql_safety(sql)
@@ -315,83 +321,109 @@ async def stream_single_query(
                         }
                         yield _done_event(False, 0.0, tables_used)
                         return
+                    # Unlike check_sql_safety above, a bad join is retryable — feed it back to
+                    # the model as a tool-error-style message (below) instead of aborting the
+                    # whole turn, so it gets a chance to fix the join and try again.
+                    bad_join_reason = guardrails.check_join_conditions(sql)
                     for table in _extract_tables_used(sql):
                         if table not in tables_used:
                             tables_used.append(table)
                     yield {"type": "sql", "content": sql, "tables_used": tables_used}
                     yield {"type": "status", "label": "Running query…"}
 
-                try:
-                    result = await mcp.call_tool(name, arguments)
-                except Exception as exc:
+                if bad_join_reason:
+                    # Skip execution entirely — this SQL wasn't run against BigQuery, so
+                    # there's no real result to parse. Same imperative-message treatment as a
+                    # genuine tool error below, so the model notices and retries rather than
+                    # hallucinating a result.
                     result_content = (
-                        "TOOL CALL FAILED — this did not run successfully and produced NO data. "
-                        f"Error: {exc}. You MUST NOT answer the user's question using this as if it "
-                        "succeeded. Either fix the problem and retry, or tell the user you couldn't "
-                        "retrieve the data."
+                        "QUERY NOT RUN — rejected before execution, no data was returned. "
+                        f"{bad_join_reason}"
                     )
                 else:
-                    # MCP tool-execution failures (e.g. a BigQuery SQL error) come back as a
-                    # *successful* JSON-RPC response with isError=true and no structuredContent —
-                    # NOT an exception, and NOT distinguishable from real data just by looking at
-                    # the raw JSON shape. Live-verified against the real hosted MCP server: a bad
-                    # column name returns {"content":[{"type":"text","text":"Unrecognized name..."}],
-                    # "isError":true}. Burying that in a raw json.dumps() of the whole payload let
-                    # the model notice-but-ignore it and hallucinate a summary instead of retrying —
-                    # so error results get an explicit, impossible-to-miss imperative message instead
-                    # of a JSON blob.
-                    is_tool_error = isinstance(result, dict) and result.get("isError")
-                    structured = result.get("structuredContent") if isinstance(result, dict) else None
-
-                    if is_tool_error:
-                        error_text = ""
-                        if isinstance(result, dict):
-                            for block in result.get("content") or []:
-                                if isinstance(block, dict) and block.get("type") == "text":
-                                    error_text = block.get("text", "")
-                                    break
+                    try:
+                        result = await mcp.call_tool(name, arguments)
+                    except Exception as exc:
                         result_content = (
-                            "QUERY FAILED — this did NOT run successfully and returned NO data. "
-                            f"Error from BigQuery: {error_text or 'unknown error'}. "
-                            "Do not answer the user's question as if this succeeded or returned "
-                            "empty results — that would be fabricating an answer. Re-check the exact "
-                            "column names and types listed in your system instructions — the schema "
-                            "there is complete and authoritative — fix the query accordingly and "
-                            "retry. If you're out of ideas, tell the user what went wrong instead of "
-                            "making up numbers."
+                            "TOOL CALL FAILED — this did not run successfully and produced NO data. "
+                            f"Error: {exc}. You MUST NOT answer the user's question using this as if it "
+                            "succeeded. Either fix the problem and retry, or tell the user you couldn't "
+                            "retrieve the data."
                         )
                     else:
-                        if _is_sql_tool(name) and _looks_like_bq_rows(structured):
-                            columns, data, total_rows = _parse_bq_rows(structured)
-                            data_rows = data[:500]
-                            truncated = total_rows > len(data_rows)
-                            fields = ((structured.get("schema") or {}).get("fields") or [])
-                            yield {
-                                "type": "rows",
-                                "columns": columns,
-                                "data": data_rows,
-                                "total_rows": total_rows,
-                                "truncated": truncated,
-                                "viz": {
-                                    "show_table": True,
-                                    "charts": _infer_charts(fields, data_rows),
-                                },
-                            }
-                            successful_result = {
-                                "sql": sql,
-                                "columns": columns,
-                                "data": data_rows,
-                                "total_rows": total_rows,
-                                "truncated": truncated,
-                            }
-                        payload = structured if structured is not None else result
-                        result_content = json.dumps(payload, default=str)
-                        if len(result_content) > CHATBOT_MAX_TOOL_RESULT_CHARS:
+                        # MCP tool-execution failures (e.g. a BigQuery SQL error) come back as a
+                        # *successful* JSON-RPC response with isError=true and no structuredContent —
+                        # NOT an exception, and NOT distinguishable from real data just by looking at
+                        # the raw JSON shape. Live-verified against the real hosted MCP server: a bad
+                        # column name returns {"content":[{"type":"text","text":"Unrecognized name..."}],
+                        # "isError":true}. Burying that in a raw json.dumps() of the whole payload let
+                        # the model notice-but-ignore it and hallucinate a summary instead of retrying —
+                        # so error results get an explicit, impossible-to-miss imperative message instead
+                        # of a JSON blob.
+                        is_tool_error = isinstance(result, dict) and result.get("isError")
+                        structured = result.get("structuredContent") if isinstance(result, dict) else None
+
+                        if is_tool_error:
+                            error_text = ""
+                            if isinstance(result, dict):
+                                for block in result.get("content") or []:
+                                    if isinstance(block, dict) and block.get("type") == "text":
+                                        error_text = block.get("text", "")
+                                        break
                             result_content = (
-                                result_content[:CHATBOT_MAX_TOOL_RESULT_CHARS]
-                                + f"... [truncated, {len(result_content)} chars total. "
-                                "Narrow the query with a LIMIT or filter and try again.]"
+                                "QUERY FAILED — this did NOT run successfully and returned NO data. "
+                                f"Error from BigQuery: {error_text or 'unknown error'}. "
+                                "Do not answer the user's question as if this succeeded or returned "
+                                "empty results — that would be fabricating an answer. Re-check the exact "
+                                "column names and types listed in your system instructions — the schema "
+                                "there is complete and authoritative — fix the query accordingly and "
+                                "retry. If you're out of ideas, tell the user what went wrong instead of "
+                                "making up numbers."
                             )
+                        else:
+                            if _is_sql_tool(name) and _looks_like_bq_rows(structured):
+                                columns, data, total_rows = _parse_bq_rows(structured)
+                                data_rows = data[:500]
+                                truncated = total_rows > len(data_rows)
+                                fields = ((structured.get("schema") or {}).get("fields") or [])
+                                yield {
+                                    "type": "rows",
+                                    "columns": columns,
+                                    "data": data_rows,
+                                    "total_rows": total_rows,
+                                    "truncated": truncated,
+                                    "viz": {
+                                        "show_table": True,
+                                        "charts": _infer_charts(fields, data_rows),
+                                    },
+                                }
+                                successful_result = {
+                                    "sql": sql,
+                                    "columns": columns,
+                                    "data": data_rows,
+                                    "total_rows": total_rows,
+                                    "truncated": truncated,
+                                }
+                                # Echo a compact, already-parsed sample back to the model instead of
+                                # the raw verbose BigQuery REST shape (`{"f":[{"v":...}]}`) — the
+                                # model only needs enough to confirm the query worked, not up to 500
+                                # raw rows. See config.py's CHATBOT_TOOL_ECHO_ROW_SAMPLE.
+                                echo_rows = data_rows[:CHATBOT_TOOL_ECHO_ROW_SAMPLE]
+                                payload = {
+                                    "columns": columns,
+                                    "rows": echo_rows,
+                                    "total_rows": total_rows,
+                                    "truncated": total_rows > len(echo_rows),
+                                }
+                            else:
+                                payload = structured if structured is not None else result
+                            result_content = json.dumps(payload, default=str)
+                            if len(result_content) > CHATBOT_MAX_TOOL_RESULT_CHARS:
+                                result_content = (
+                                    result_content[:CHATBOT_MAX_TOOL_RESULT_CHARS]
+                                    + f"... [truncated, {len(result_content)} chars total. "
+                                    "Narrow the query with a LIMIT or filter and try again.]"
+                                )
 
                 messages.extend(messages_with_tool_result(provider, call["id"], name, result_content))
 
@@ -412,12 +444,16 @@ async def stream_single_query(
         # itself. No tools offered here — this call only turns already-fetched rows into an
         # analyst-voice answer, it never queries anything itself. -----------------------
         yield {"type": "status", "label": "Writing your answer…"}
+        # Independent, much smaller sample than the up-to-500-row `successful_result["data"]`
+        # (that cap is sized for the frontend table/chart, not for formatting into an LLM
+        # prompt as text lines). See config.py's CHATBOT_ANSWER_ROWS_SAMPLE.
+        answer_sample = successful_result["data"][:CHATBOT_ANSWER_ROWS_SAMPLE]
         query_result_block = prompts.format_query_result_block(
             successful_result["sql"],
             successful_result["columns"],
-            successful_result["data"],
+            answer_sample,
             successful_result["total_rows"],
-            successful_result["truncated"],
+            successful_result["total_rows"] > len(answer_sample),
         )
         answer_messages = [
             {"role": "system", "content": prompts.build_answer_generation_system_prompt(message, query_result_block)},

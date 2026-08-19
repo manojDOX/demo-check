@@ -384,7 +384,20 @@ call the SQL-execution tool with that query.
   subscription with no linked customer). `location_id` links location_360_vw and session_360_vw
   at the location grain. daily_business_metrics_vw has no customer or location key at all — it's
   a business-wide daily aggregate (keyed only by `metric_date`) and cannot be joined to the other
-  4 tables at customer or location grain.
+  4 tables at customer or location grain. Every `JOIN ... ON` condition MUST equate two of these
+  matching key columns with `=` (e.g. `ON s.location_id = l.location_id`) — a join condition is
+  never a filter/comparison predicate. WRONG, do not do this: `JOIN location_360_vw l JOIN
+  customer_360_vw c ON l.total_customers > 0` — `total_customers > 0` is a filter, not a shared
+  key, and produces a meaningless cartesian-style result; if two tables don't share one of the
+  key columns listed above, don't join them — answer from one table alone or say the question
+  needs data that can't be joined together.
+- KEEP RESULT SIZE PROPORTIONAL TO THE QUESTION: for a count/aggregate question ("how many",
+  "average", "total", "percentage"), write SQL that computes the aggregate in BigQuery
+  (COUNT/SUM/AVG/GROUP BY) and returns just the aggregated row(s) — never pull back the raw
+  matching rows for the model to count itself. For a "list"/"show me" question, add a reasonable
+  `LIMIT` (100–200) unless the user explicitly asked for the complete set — an unbounded raw row
+  dump wastes tokens and isn't more useful to the user than a representative sample plus the
+  total count.
 - Prefer the read-only SQL-execution tool; do not attempt to write or modify data unless the
   user explicitly asks for it.
 - ROW-COUNTING GOTCHAS (verified against live data, not assumed): subscription_360_vw has exact
