@@ -55,6 +55,12 @@ class ChatSession(Base):
         "token_id", String, ForeignKey("chatbot_tokens.id", ondelete="SET NULL")
     )
     name: Mapped[str | None] = mapped_column(String)
+    # Set by the "Clear history" action (POST .../clear-history) to the moment it was
+    # clicked. service.py's history loader only threads messages created AFTER this
+    # timestamp into the LLM's conversation context — earlier turns stay visible in the
+    # UI (nothing is deleted) but stop being sent to the model. NULL means "never cleared,
+    # use full history" (bounded by the existing 5-turn window either way).
+    history_cleared_at: Mapped[datetime | None] = mapped_column("history_cleared_at", DateTime)
     created_at: Mapped[datetime] = mapped_column("created_at", DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column("updated_at", DateTime, server_default=func.now())
 

@@ -33,7 +33,9 @@ import {
   RefreshCw,
   Loader2,
   Plus,
+  Eraser,
 } from "lucide-react";
+import { useToast } from "@/hooks/use-toast";
 import type { BigQueryConnection } from "@shared/schema";
 
 interface ChatSessionSummary {
@@ -43,6 +45,7 @@ interface ChatSessionSummary {
   connectionId: number | null;
   tokenId: string | null;
   name: string | null;
+  historyClearedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -68,6 +71,10 @@ interface ConversationTurn {
   rows: ChatRowsPayload | null;
   confidence: number | null;
   tablesUsed: string[];
+  // Set on the first turn asked right after a "Clear History" click, so the transcript can
+  // show a divider there — the turn itself and everything after it stays fully visible,
+  // only what's sent to the LLM as context resets at this point.
+  historyClearedBefore?: boolean;
 }
 
 type VisualizationType = "bar" | "line" | "pie" | "table";
@@ -98,6 +105,10 @@ export default function QueryPage() {
   const [turns, setTurns] = useState<ConversationTurn[]>([]);
   const [sessionsOpen, setSessionsOpen] = useState(false);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
+  // True right after "Clear History" is clicked, until the next turn lands — marks that
+  // turn so the transcript can render a divider showing where the LLM's context reset.
+  const [pendingHistoryClear, setPendingHistoryClear] = useState(false);
+  const { toast } = useToast();
 
   const urlParams = new URLSearchParams(location.split("?")[1] || "");
   const initialQuery = urlParams.get("q") || "";
@@ -144,8 +155,10 @@ export default function QueryPage() {
         rows: chat.rows,
         confidence: chat.confidence,
         tablesUsed: chat.tablesUsed,
+        historyClearedBefore: pendingHistoryClear,
       },
     ]);
+    setPendingHistoryClear(false);
     queryClient.invalidateQueries({ queryKey: ["/api/chat/sessions"] });
     setCurrentQuestion("");
     chat.reset();
@@ -179,6 +192,7 @@ export default function QueryPage() {
     setSessionId(null);
     setTurns([]);
     setCurrentQuestion("");
+    setPendingHistoryClear(false);
   };
 
   const handleSelectSession = async (session: ChatSessionSummary) => {
@@ -186,6 +200,7 @@ export default function QueryPage() {
     chat.reset();
     setSessionId(session.id);
     setCurrentQuestion("");
+    setPendingHistoryClear(false);
     setIsLoadingMessages(true);
     try {
       const res = await apiRequest("GET", `/api/chat/sessions/${session.id}/messages`);
@@ -222,6 +237,31 @@ export default function QueryPage() {
     } finally {
       setIsLoadingMessages(false);
     }
+  };
+
+  const clearHistoryMutation = useMutation({
+    mutationFn: async (id: string) => {
+      await apiRequest("POST", `/api/chat/sessions/${id}/clear-history`);
+    },
+    onSuccess: () => {
+      setPendingHistoryClear(true);
+      toast({
+        title: "History cleared",
+        description: "Past messages stay visible below, but the next question starts fresh — no earlier context is sent to the model.",
+      });
+    },
+    onError: () => {
+      toast({
+        title: "Couldn't clear history",
+        description: "Please try again.",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const handleClearHistory = () => {
+    if (!sessionId || chat.isStreaming) return;
+    clearHistoryMutation.mutate(sessionId);
   };
 
   const deleteSessionMutation = useMutation({
@@ -262,6 +302,22 @@ export default function QueryPage() {
           >
             <Plus className="h-4 w-4" />
             New Chat
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-2"
+            onClick={handleClearHistory}
+            disabled={!sessionId || chat.isStreaming || clearHistoryMutation.isPending}
+            title="Keep this chat, but stop sending earlier messages as context to the model"
+            data-testid="button-clear-history"
+          >
+            {clearHistoryMutation.isPending ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Eraser className="h-4 w-4" />
+            )}
+            Clear History
           </Button>
           <div className="flex items-center gap-2">
             <Database className="h-4 w-4 text-muted-foreground" />
@@ -401,15 +457,26 @@ export default function QueryPage() {
       )}
 
       {orderedTurns.map((turn) => (
-        <QueryResult
-          key={turn.id}
-          query={turn.question}
-          summary={turn.summary}
-          data={turn.rows?.data ?? []}
-          sql={turn.sql ?? undefined}
-          visualizationType={mapChartType(turn.rows)}
-          clientId={selectedClientId}
-        />
+        <div key={turn.id}>
+          {turn.historyClearedBefore && (
+            <div className="flex items-center gap-3 py-1 text-xs text-muted-foreground">
+              <div className="h-px flex-1 bg-border" />
+              <span className="flex items-center gap-1.5">
+                <Eraser className="h-3 w-3" />
+                History cleared — messages below are no longer sent to the model
+              </span>
+              <div className="h-px flex-1 bg-border" />
+            </div>
+          )}
+          <QueryResult
+            query={turn.question}
+            summary={turn.summary}
+            data={turn.rows?.data ?? []}
+            sql={turn.sql ?? undefined}
+            visualizationType={mapChartType(turn.rows)}
+            clientId={selectedClientId}
+          />
+        </div>
       ))}
 
       <Collapsible open={sessionsOpen} onOpenChange={setSessionsOpen}>

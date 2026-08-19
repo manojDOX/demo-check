@@ -86,12 +86,21 @@ async def _resolve_or_create_session(
     return session
 
 
-async def _load_history_from_db(db: AsyncSession, session_id: str) -> list[dict]:
+async def _load_history_from_db(db: AsyncSession, session_id: str, history_cleared_at) -> list[dict]:
     """Threads only the question and the LLM's own narrative answer into the next request's
     conversation history — never the SQL or query-result rows (those stay persisted on the
     ChatMessage row itself for re-rendering a session's past turns in the UI, just not fed
-    back to the LLM as context)."""
+    back to the LLM as context).
+
+    `history_cleared_at` is the session's "Clear history" marker (see
+    repo.clear_session_history) — messages created at or before it are excluded from what's
+    sent to the LLM, even though they're still stored and still shown in the UI transcript.
+    After a clear, this turn's history starts empty and the usual 5-turn window builds back
+    up from there as the conversation continues, exactly as if this were a brand-new
+    session, until the user clears again."""
     messages = await repo.get_messages(db, session_id)
+    if history_cleared_at is not None:
+        messages = [m for m in messages if m.created_at > history_cleared_at]
     recent = messages[-_HISTORY_LOAD_LIMIT:]
     return [{"role": message.role, "content": message.content} for message in recent]
 
@@ -181,7 +190,9 @@ async def stream_chat(
         return
 
     is_resuming = bool(session_id) and session_id == session.id
-    conversation_history = await _load_history_from_db(db, session.id) if is_resuming else []
+    conversation_history = (
+        await _load_history_from_db(db, session.id, session.history_cleared_at) if is_resuming else []
+    )
 
     final_sql: str | None = None
     final_confidence = 0.0

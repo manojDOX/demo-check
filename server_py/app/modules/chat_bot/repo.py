@@ -140,6 +140,16 @@ async def touch_session(db: AsyncSession, session_id: str, *, first_message: str
     await db.commit()
 
 
+async def clear_session_history(db: AsyncSession, session_id: str) -> ChatSession | None:
+    """Stamps history_cleared_at to now — service.py's history loader excludes any
+    message created before this from what's threaded into the LLM's context. Messages
+    themselves are untouched (still returned by get_messages for the UI transcript).
+    Naive UTC to match created_at/updated_at's TIMESTAMP WITHOUT TIME ZONE columns
+    (see update_session/touch_session above) — an aware value would compare unequal to
+    those in SQL despite representing the same instant."""
+    return await update_session(db, session_id, history_cleared_at=datetime.utcnow())
+
+
 async def delete_session(db: AsyncSession, session_id: str) -> None:
     # ChatMessage rows cascade-delete via the FK's ondelete="CASCADE".
     await db.execute(delete(ChatSession).where(ChatSession.id == session_id))

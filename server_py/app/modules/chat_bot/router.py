@@ -112,6 +112,22 @@ async def rename_session(session_id: str, body: RenameSessionBody, request: Requ
     return to_camel(updated)
 
 
+@router.post("/api/chat/sessions/{session_id}/clear-history")
+async def clear_session_history(session_id: str, request: Request, db: AsyncSession = Depends(get_db)):
+    """Resets what's fed to the LLM as conversation history without deleting anything —
+    the UI transcript (GET .../messages) is unaffected; only future turns in this session
+    stop referencing messages from before this call. See repo.clear_session_history /
+    service._load_history_from_db."""
+    user_id = get_user_id(request)
+    session = await repo.get_session(db, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if not await _can_access_session(request, db, session, user_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+    updated = await repo.clear_session_history(db, session_id)
+    return to_camel(updated)
+
+
 @router.delete("/api/chat/sessions/{session_id}")
 async def delete_session(session_id: str, request: Request, db: AsyncSession = Depends(get_db)):
     user_id = get_user_id(request)
