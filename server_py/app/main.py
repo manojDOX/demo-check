@@ -1,4 +1,8 @@
+import asyncio
+import subprocess
+import sys
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -10,7 +14,47 @@ from app.session_store import PostgresSessionMiddleware
 
 settings = get_settings()
 
-app = FastAPI(title="XIOMARA API")
+# Directory containing alembic.ini — app/main.py -> app/ -> server_py/.
+_SERVER_PY_DIR = Path(__file__).resolve().parents[1]
+
+
+def _run_pending_migrations() -> None:
+    """Runs `alembic upgrade head` as a subprocess against the same interpreter/venv this
+    server runs under, so a deploy can never again leave the DB schema behind the code that
+    expects it (see the ChatSession.history_cleared_at incident: the column was added to
+    the model without the migration being applied, and every query touching ChatSession
+    500'd until someone ran this by hand). A subprocess — not alembic's Python API called
+    in-process — because alembic/env.py's run_migrations_online() unconditionally calls
+    asyncio.run(), which raises if invoked from inside the event loop this FastAPI app is
+    already running on. Logged, not raised: a migration failure (e.g. a genuine schema
+    conflict needing a human) shouldn't take down routes unrelated to the affected tables."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            cwd=_SERVER_PY_DIR,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            print(
+                "[startup] alembic upgrade head FAILED "
+                f"(exit {result.returncode}) — DB schema may be behind the code:\n"
+                f"{result.stdout}\n{result.stderr}"
+            )
+        else:
+            print("[startup] alembic upgrade head: database schema is up to date")
+    except Exception as exc:  # noqa: BLE001 - never block server startup on this
+        print(f"[startup] alembic upgrade head errored: {exc}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await asyncio.to_thread(_run_pending_migrations)
+    yield
+
+
+app = FastAPI(title="XIOMARA API", lifespan=lifespan)
 
 # Server-side session store, backed by the `sessions` table (Replit-Auth-mandatory shape).
 app.add_middleware(PostgresSessionMiddleware)
