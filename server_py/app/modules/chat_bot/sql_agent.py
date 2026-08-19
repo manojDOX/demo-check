@@ -274,8 +274,13 @@ async def stream_single_query(
         for round_idx in range(CHATBOT_MAX_TOOL_ROUNDS):
             yield {"type": "status", "label": status_labels[min(round_idx, len(status_labels) - 1)]}
             try:
+                # This step's output is just a SQL string passed as a tool-call argument (or,
+                # in the out-of-scope branch, a short plain-text refusal) — not free-form
+                # prose. Even a query with several CTEs/JOINs rarely runs past a few hundred
+                # tokens, so this only needs headroom for an unusually long query, not the
+                # 3000 carried over from the reference implementation's answer-writing budget.
                 response = await call_llm_with_tools(
-                    provider, model, api_key, messages, openai_format_tools, max_tokens=3000, temperature=0.2
+                    provider, model, api_key, messages, openai_format_tools, max_tokens=1000, temperature=0.2
                 )
             except Exception as error:
                 yield {"type": "error", "content": f"Couldn't get a response from the model: {error}"}
