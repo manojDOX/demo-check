@@ -33,3 +33,12 @@ CHATBOT_ANSWER_ROWS_SAMPLE = 30
 CHATBOT_LIST_SUMMARY_MIN_ROWS = 20
 CHATBOT_LIST_BREAKDOWN_MAX_COLUMNS = 4
 CHATBOT_LIST_BREAKDOWN_MAX_VALUES = 10
+
+# Empirically observed per-call row cap on Google's hosted BigQuery MCP server's
+# execute_sql(_readonly) tool (live-verified 2026-08-20): a query matching more rows than this
+# still only returns this many, AND the result's own `totalRows` field does not reliably report
+# the true total beyond it either — so `total_rows > len(data)` (sql_agent.py's usual truncation
+# signal) can fail to catch this case. When `len(data)` hits this cap, sql_agent.py treats the
+# true total as unknown/at-least rather than trusting `total_rows` at face value. Bump this if
+# Google changes the hosted server's cap.
+CHATBOT_MCP_ROW_CAP = 3000

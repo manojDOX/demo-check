@@ -38,6 +38,7 @@ from app.modules.chat_bot.config import (
     CHATBOT_LIST_SUMMARY_MIN_ROWS,
     CHATBOT_MAX_TOOL_RESULT_CHARS,
     CHATBOT_MAX_TOOL_ROUNDS,
+    CHATBOT_MCP_ROW_CAP,
     CHATBOT_TOOL_ECHO_ROW_SAMPLE,
 )
 from app.modules.chat_bot.llm_client import (
@@ -206,6 +207,26 @@ _NUMERIC_FIELD_TYPES = {"INT64", "INTEGER", "FLOAT64", "FLOAT", "NUMERIC", "BIGN
 
 def _humanize_column(name: str) -> str:
     return name.replace("_", " ").strip().title()
+
+
+def _find_date_range(fields: list[dict], data: list[dict]) -> tuple[str, str, str] | None:
+    """Picks the first DATE/DATETIME/TIMESTAMP/TIME-typed column in the result (in column
+    order) and returns (column_name, min_value, max_value) computed over the actual returned
+    rows, or None if no such column exists or every value is missing. Values are already
+    normalized to sortable strings by _convert_bq_cell (TIMESTAMP/DATETIME -> "YYYY-MM-DD
+    HH:MM:SS UTC"; DATE passes through BigQuery's own "YYYY-MM-DD" string as-is), so plain
+    string min/max gives the correct chronological bounds without parsing dates ourselves —
+    deliberately not delegated to the LLM (same reasoning as _convert_bq_cell's epoch-seconds
+    conversion: the model can't reliably state an exact date from what it's given)."""
+    for field in fields:
+        name = field.get("name")
+        if (field.get("type") or "").upper() not in _DATE_FIELD_TYPES:
+            continue
+        values = [row.get(name) for row in data if row.get(name)]
+        if not values:
+            continue
+        return name, min(values), max(values)
+    return None
 
 
 def _infer_charts(fields: list[dict], data: list[dict]) -> list[dict]:
@@ -441,7 +462,13 @@ async def stream_single_query(
                             if _is_sql_tool(name) and _looks_like_bq_rows(structured):
                                 columns, data, total_rows = _parse_bq_rows(structured)
                                 data_rows = data[:500]
-                                truncated = total_rows > len(data_rows)
+                                # The MCP tool's own `totalRows` doesn't reliably report the true
+                                # total once `data` itself hits CHATBOT_MCP_ROW_CAP (see config.py) —
+                                # so a query matching MORE than the cap can still come back with
+                                # total_rows == len(data) == cap, which would make the usual
+                                # `total_rows > len(data)` check below miss the truncation entirely.
+                                hit_row_cap = len(data) >= CHATBOT_MCP_ROW_CAP
+                                truncated = total_rows > len(data_rows) or hit_row_cap
                                 fields = ((structured.get("schema") or {}).get("fields") or [])
                                 yield {
                                     "type": "rows",
@@ -464,6 +491,13 @@ async def stream_single_query(
                                     "full_data": data,
                                     "total_rows": total_rows,
                                     "truncated": truncated,
+                                    "hit_row_cap": hit_row_cap,
+                                    # Only trustworthy when the full matching set was actually
+                                    # retrieved — a range computed from a partial/capped result
+                                    # would understate true coverage, so this is populated here
+                                    # but only used for the final answer when that's the case
+                                    # (see the date-range append below).
+                                    "date_range": _find_date_range(fields, data),
                                 }
                                 # Echo a compact, already-parsed sample back to the model instead of
                                 # the raw verbose BigQuery REST shape (`{"f":[{"v":...}]}`) — the
@@ -533,6 +567,18 @@ async def stream_single_query(
                 successful_result["total_rows"],
                 successful_result["total_rows"] > len(answer_sample),
             )
+        if successful_result.get("hit_row_cap"):
+            # Both branches above may have already stated `total_rows` as if it were exact — it
+            # isn't, once the MCP tool's own row cap is hit (see the hit_row_cap comment where
+            # it's computed). Append this regardless of which branch ran, so the model can't
+            # present the capped count as a final total either way.
+            query_result_block += (
+                f"\n\nNote: this query hit the query tool's per-call cap of {CHATBOT_MCP_ROW_CAP} "
+                f"rows — at least {len(successful_result['full_data'])} rows matched, but the true "
+                "total could be higher and is not knowable from this result. Say so plainly if you "
+                "report a count from this data (e.g. \"at least N\", not a bare total) — do not "
+                "state the capped number as if it were the complete total."
+            )
         answer_messages = [
             {"role": "system", "content": prompts.build_answer_generation_system_prompt(message, query_result_block)},
             {"role": "user", "content": message},
@@ -547,6 +593,19 @@ async def stream_single_query(
             return
 
         content = _strip_markdown_formatting((answer_response.get("content") or "").strip())
+        # Deterministic, not model-authored — appended after generation rather than asked of the
+        # model, same reasoning as the row-cap note above: the model shouldn't be trusted to
+        # restate an exact date range itself. Only when the full matching set was actually
+        # retrieved (not truncated/capped) — a range from a partial result would understate the
+        # data's true coverage, which is worse than omitting the line.
+        date_range = successful_result.get("date_range")
+        full_data_complete = (
+            successful_result["total_rows"] <= len(successful_result["full_data"])
+            and not successful_result.get("hit_row_cap")
+        )
+        if content and date_range and full_data_complete:
+            _, min_value, max_value = date_range
+            content += f"\n\nThis response is based on data from {min_value} to {max_value}."
         if content:
             yield {"type": "text", "content": content}
         else:
