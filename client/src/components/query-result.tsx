@@ -89,6 +89,44 @@ const CHART_COLORS = [
   "hsl(280, 68%, 60%)",
 ];
 
+// Renders the chatbot's plain-text answer with minimal structure: a blank line starts a new
+// paragraph, a line starting "- " becomes a bullet row, and "**bold**" spans become <strong>.
+// No markdown headers/numbered lists — the answer-generation prompt (prompts.py) is instructed
+// to stick to exactly this subset, so this renderer only needs to handle exactly this subset.
+function FormattedAnswerText({ text }: { text: string }) {
+  const renderInline = (line: string, key: string | number) => {
+    const parts = line.split(/(\*\*.*?\*\*)/g);
+    return (
+      <span key={key}>
+        {parts.map((part, j) =>
+          part.startsWith("**") && part.endsWith("**") ? (
+            <strong key={j}>{part.slice(2, -2)}</strong>
+          ) : (
+            part
+          )
+        )}
+      </span>
+    );
+  };
+
+  return (
+    <>
+      {text.split("\n").map((line, i) => {
+        if (line.trim() === "") return <div key={i} className="h-2" />;
+        if (line.startsWith("- ")) {
+          return (
+            <div key={i} className="flex gap-2 my-1">
+              <span className="text-primary mt-0.5">-</span>
+              {renderInline(line.replace("- ", ""), `${i}-content`)}
+            </div>
+          );
+        }
+        return <p key={i}>{renderInline(line, `${i}-content`)}</p>;
+      })}
+    </>
+  );
+}
+
 export function QueryResult({
   query,
   summary,
@@ -979,7 +1017,7 @@ export function QueryResult({
                 <span className="text-xs">{isPlaying ? "Stop" : "Listen"}</span>
               </Button>
             </div>
-            <p className="text-foreground">{summary}</p>
+            <div className="text-foreground"><FormattedAnswerText text={summary} /></div>
           </div>
 
           {isRecommendation && recommendation && (

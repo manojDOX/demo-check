@@ -33,6 +33,9 @@ from datetime import datetime, timezone
 from app.modules.chat_bot import guardrails, prompts
 from app.modules.chat_bot.config import (
     CHATBOT_ANSWER_ROWS_SAMPLE,
+    CHATBOT_LIST_BREAKDOWN_MAX_COLUMNS,
+    CHATBOT_LIST_BREAKDOWN_MAX_VALUES,
+    CHATBOT_LIST_SUMMARY_MIN_ROWS,
     CHATBOT_MAX_TOOL_RESULT_CHARS,
     CHATBOT_MAX_TOOL_ROUNDS,
     CHATBOT_TOOL_ECHO_ROW_SAMPLE,
@@ -51,14 +54,12 @@ from app.modules.chat_bot.mcp_client import BigQueryMCPClient
 # below is a defensive net in case Google renames/adds an execute-style tool later.
 _KNOWN_SQL_TOOL_NAMES = {"execute_sql_readonly", "execute_sql"}
 
-# Belt-and-braces cleanup for the final answer text: the chat UI renders it as plain text
-# (no markdown parser — see query-result.tsx's `<p>{summary}</p>`), but LLMs reliably reach
-# for **bold**/markdown syntax regardless of the prompt's "PLAIN TEXT ONLY" instruction —
-# live-verified across providers that the instruction alone isn't consistently followed.
-# Strips just the bold markers (the specific defect actually observed: literal "**Name**"
-# reaching the screen) — deliberately NOT touching single "_"/"*" since those appear inside
-# real content here (e.g. email addresses like "c_navedo@icloud.com").
-_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
+# Belt-and-braces cleanup for the final answer text: query-result.tsx's FormattedAnswerText
+# renders exactly "**bold**", "- " bullets, and blank-line paragraph breaks — nothing else — so
+# **bold** is intentionally left alone here (the UI now interprets it), but markdown headers
+# (#, ##, ...) aren't part of that supported subset and LLMs reliably reach for them anyway
+# despite the prompt's instruction not to — live-verified across providers that the instruction
+# alone isn't consistently followed. Strips just the header markers, leaving the header text.
 _MD_HEADER_RE = re.compile(r"(?m)^#{1,6}[ \t]+")
 
 
@@ -66,7 +67,6 @@ def _strip_markdown_formatting(text: str) -> str:
     if not text:
         return text
     text = _MD_HEADER_RE.sub("", text)
-    text = _MD_BOLD_RE.sub(lambda m: m.group(1) or m.group(2) or "", text)
     return text
 
 
@@ -95,6 +95,58 @@ def _extract_tables_used(sql: str) -> list[str]:
         if ref not in seen:
             seen.append(ref)
     return seen
+
+
+# Coarse, whole-string detection of whether a SQL result is a raw entity list vs an already-
+# aggregated result — same regex-based-guardrail style as guardrails.check_join_conditions, not
+# a real SQL parser. A query that only uses an aggregate inside a subquery/window function would
+# be misclassified as aggregate-shaped, which just means it falls back to the existing row-sample
+# narrative path below (a missed optimization, not a correctness bug).
+_AGGREGATE_SHAPE_RE = re.compile(r"\b(COUNT|SUM|AVG|MIN|MAX)\s*\(|\bGROUP\s+BY\b", re.IGNORECASE)
+
+
+def _is_list_shaped_sql(sql: str) -> bool:
+    return not _AGGREGATE_SHAPE_RE.search(sql or "")
+
+
+def _build_list_aggregate_summary(sql: str, columns: list[str], data: list[dict], total_rows: int) -> str:
+    """Builds a compact <QUERY_RESULT> text block for a large list-shaped result: a total-count
+    line (plus an honesty caveat when `data` is itself only a slice of `total_rows`, whether from
+    our own courtesy caps or a silent cap the MCP tool applies upstream) and a per-column
+    value-count breakdown for any column that looks categorical, instead of dumping individual
+    rows into the LLM prompt. See config.py's CHATBOT_LIST_SUMMARY_MIN_ROWS/
+    CHATBOT_LIST_BREAKDOWN_MAX_COLUMNS/CHATBOT_LIST_BREAKDOWN_MAX_VALUES."""
+    lines = [f"SQL executed:\n{sql}", "", f"Total matching rows: {len(data)}"]
+    if total_rows > len(data):
+        lines.append(
+            f"Note: only {len(data)} of {total_rows} total matching rows were available to "
+            "summarize — the breakdown below is representative of that sample, not exact for "
+            "the full total."
+        )
+
+    breakdown_count = 0
+    for col in columns:
+        if breakdown_count >= CHATBOT_LIST_BREAKDOWN_MAX_COLUMNS:
+            break
+        counts: dict = {}
+        for row in data:
+            value = row.get(col)
+            counts[value] = counts.get(value, 0) + 1
+        distinct_count = len(counts)
+        # "Categorical enough to break down": a handful of repeated values, not a near-unique
+        # column like an id/email/name (which would have ~len(data) distinct values).
+        if not (2 <= distinct_count <= 20) or distinct_count >= len(data):
+            continue
+        ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+        shown = ranked[:CHATBOT_LIST_BREAKDOWN_MAX_VALUES]
+        remainder = len(ranked) - len(shown)
+        parts = [f"{value} ({count})" for value, count in shown]
+        if remainder > 0:
+            parts.append(f"+{remainder} others")
+        lines.append(f"Breakdown by {col}: " + ", ".join(parts))
+        breakdown_count += 1
+
+    return "\n".join(lines)
 
 
 _TIMESTAMP_FIELD_TYPES = {"TIMESTAMP", "DATETIME"}
@@ -406,6 +458,10 @@ async def stream_single_query(
                                     "sql": sql,
                                     "columns": columns,
                                     "data": data_rows,
+                                    # Full set the MCP tool actually returned, before the 500-row
+                                    # UI-display slice above — used by _build_list_aggregate_summary
+                                    # for an accurate row count/breakdown, not the UI's capped view.
+                                    "full_data": data,
                                     "total_rows": total_rows,
                                     "truncated": truncated,
                                 }
@@ -449,17 +505,34 @@ async def stream_single_query(
         # itself. No tools offered here — this call only turns already-fetched rows into an
         # analyst-voice answer, it never queries anything itself. -----------------------
         yield {"type": "status", "label": "Writing your answer…"}
-        # Independent, much smaller sample than the up-to-500-row `successful_result["data"]`
-        # (that cap is sized for the frontend table/chart, not for formatting into an LLM
-        # prompt as text lines). See config.py's CHATBOT_ANSWER_ROWS_SAMPLE.
-        answer_sample = successful_result["data"][:CHATBOT_ANSWER_ROWS_SAMPLE]
-        query_result_block = prompts.format_query_result_block(
-            successful_result["sql"],
-            successful_result["columns"],
-            answer_sample,
-            successful_result["total_rows"],
-            successful_result["total_rows"] > len(answer_sample),
-        )
+        # List-shaped results (raw entities, no COUNT/SUM/AVG/GROUP BY) above the row threshold
+        # get a Python-computed aggregate breakdown instead of a row sample — dumping hundreds of
+        # `col=val` lines into the prompt for the model to narrate is wasteful and prone to the
+        # model just enumerating rows back in prose. Small list results (e.g. "list the
+        # subscription tiers" -> 3 rows) and aggregate-shaped results keep the existing row-sample
+        # path unchanged. See config.py's CHATBOT_LIST_SUMMARY_MIN_ROWS.
+        if (
+            _is_list_shaped_sql(successful_result["sql"])
+            and successful_result["total_rows"] > CHATBOT_LIST_SUMMARY_MIN_ROWS
+        ):
+            query_result_block = _build_list_aggregate_summary(
+                successful_result["sql"],
+                successful_result["columns"],
+                successful_result["full_data"],
+                successful_result["total_rows"],
+            )
+        else:
+            # Independent, much smaller sample than the up-to-500-row `successful_result["data"]`
+            # (that cap is sized for the frontend table/chart, not for formatting into an LLM
+            # prompt as text lines). See config.py's CHATBOT_ANSWER_ROWS_SAMPLE.
+            answer_sample = successful_result["data"][:CHATBOT_ANSWER_ROWS_SAMPLE]
+            query_result_block = prompts.format_query_result_block(
+                successful_result["sql"],
+                successful_result["columns"],
+                answer_sample,
+                successful_result["total_rows"],
+                successful_result["total_rows"] > len(answer_sample),
+            )
         answer_messages = [
             {"role": "system", "content": prompts.build_answer_generation_system_prompt(message, query_result_block)},
             {"role": "user", "content": message},
