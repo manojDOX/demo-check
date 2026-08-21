@@ -254,25 +254,85 @@ _ALL_TABLES = [
 ]
 
 
-def _table_as_ddl(table_id: str, schema: list[tuple[str, str, str]], grain_description: str) -> str:
+# Which (table_id, column_name) pairs get a dynamic "earliest available date" note appended to
+# their description, and which of the two computed floors applies. These columns are all
+# ultimately sourced (directly or via MIN/MAX) from autocare_ss.data (session_date) or
+# autocare_ss.stripe_customers (customer_created_date) — see data_availability.py's module
+# docstring for why only these two, and only these two raw tables, are affected: unlike
+# stripe_ss.* (pulled from Stripe's API, full history available), AutoCare's own API cannot
+# backfill data before a fixed point.
+_SESSION_MIN_DATE_COLUMNS = {(SESSION_360_VW_TABLE_ID, "session_date")}
+_CUSTOMER_MIN_DATE_COLUMNS = {
+    (CUSTOMER_360_TABLE_ID, "customer_created_date"),
+    (SESSION_360_VW_TABLE_ID, "customer_created_date"),
+    (SUBSCRIPTION_360_VW_TABLE_ID, "customer_created_date"),
+}
+
+
+def _min_date_note(table_id: str, column_name: str, min_session_date: str | None, min_customer_created_date: str | None) -> str:
+    if (table_id, column_name) in _SESSION_MIN_DATE_COLUMNS and min_session_date:
+        return (
+            f" Earliest available date in this data: {min_session_date} — there is no session "
+            "history before this date; an empty result for an earlier period means no data "
+            "exists, not that nothing happened."
+        )
+    if (table_id, column_name) in _CUSTOMER_MIN_DATE_COLUMNS and min_customer_created_date:
+        return (
+            f" Earliest available date in this data: {min_customer_created_date} — there is no "
+            "customer-record history before this date; an empty result for an earlier period "
+            "means no data exists, not that nothing happened."
+        )
+    return ""
+
+
+def _table_as_ddl(
+    table_id: str,
+    schema: list[tuple[str, str, str]],
+    grain_description: str,
+    min_session_date: str | None,
+    min_customer_created_date: str | None,
+) -> str:
     """Renders one table's schema as a CREATE TABLE statement with one inline comment per
     column, per the article's #3/#4 guidance (DDL is the format the model has seen the most
     of in its own training data for describing tables; comments carry the human
     description), plus a leading one-line grain comment. Tables with no schema filled in yet
-    render as a TODO placeholder block instead of guessing columns."""
+    render as a TODO placeholder block instead of guessing columns. min_session_date/
+    min_customer_created_date (already-formatted 'YYYY-MM-DD' strings, or None if not yet
+    computed for this connection — see data_availability.get_min_dates) get appended to the
+    specific columns in _SESSION_MIN_DATE_COLUMNS/_CUSTOMER_MIN_DATE_COLUMNS; omitted entirely
+    when the corresponding date isn't available yet, rather than leaking a placeholder."""
     if not schema:
         return f"-- {grain_description}\nCREATE TABLE `{table_id}` (\n  -- TODO: schema not filled in yet\n);"
 
     def _column_line(name: str, dtype: str, desc: str) -> str:
-        return f"  {name} {dtype} -- {desc}" if desc else f"  {name} {dtype}"
+        full_desc = desc + _min_date_note(table_id, name, min_session_date, min_customer_created_date)
+        return f"  {name} {dtype} -- {full_desc}" if full_desc else f"  {name} {dtype}"
 
     column_lines = ",\n".join(_column_line(name, dtype, desc) for name, dtype, desc in schema)
     return f"-- {grain_description}\nCREATE TABLE `{table_id}` (\n{column_lines}\n);"
 
 
-_SQL_SCHEMA_BLOCK = "\n\n".join(
-    _table_as_ddl(table_id, schema, grain_description) for table_id, schema, grain_description in _ALL_TABLES
+_DAILY_METRICS_FLOOR_NOTE_TEMPLATE = (
+    " Its session/customer-driven metrics (total_sessions, unique_visiting_customers, "
+    "new_customers, repeat_customers, locations_with_sessions, active_locations_with_sessions) "
+    "are only meaningful from {floor} forward, even though metric_date itself may start earlier "
+    "(it also spans subscription-creation dates, which aren't limited the same way) — treat "
+    "zeros before that date as missing data, not as \"nothing happened.\""
 )
+
+
+def _build_sql_schema_block(min_session_date: str | None, min_customer_created_date: str | None) -> str:
+    """Rebuilt per request (see build_sql_generation_system_prompt) so the two dynamic date
+    floors can be threaded into the affected column descriptions — cheap string formatting, no
+    I/O; the actual BigQuery lookups happen once per connection in data_availability.py."""
+    blocks = []
+    for table_id, schema, grain_description in _ALL_TABLES:
+        if table_id == DAILY_BUSINESS_METRICS_TABLE_ID:
+            floor = min_session_date or min_customer_created_date
+            if floor:
+                grain_description = grain_description + _DAILY_METRICS_FLOOR_NOTE_TEMPLATE.format(floor=floor)
+        blocks.append(_table_as_ddl(table_id, schema, grain_description, min_session_date, min_customer_created_date))
+    return "\n\n".join(blocks)
 
 # ---------------------------------------------------------------------------
 # Step 1: natural-language question -> SQL (the only step this file covers so far).
@@ -433,15 +493,23 @@ reference each table as shown in <SQL_SCHEMA> (backtick-quoted, dataset.table fo
 FROM/JOIN clauses."""
 
 
-def build_sql_generation_system_prompt(user_message: str) -> str:
+def build_sql_generation_system_prompt(
+    user_message: str,
+    min_session_date: str | None = None,
+    min_customer_created_date: str | None = None,
+) -> str:
     """Rebuilds the system prompt fresh for the current turn, embedding the live question in
     <USER_PROMPT> at the top of the prompt, above <TABLE_GUIDE> and <SQL_SCHEMA> — the
     article's template shape, extended with a table-selection guide so the model picks the
     right table from business intent before it ever reads the column-level DDL. Called once
     per new user question in sql_agent.py's _build_initial_messages(), not cached at import
-    time, since the question changes every call."""
+    time, since the question changes every call. min_session_date/min_customer_created_date
+    (from data_availability.get_min_dates, 'YYYY-MM-DD' or None) get threaded into the affected
+    AutoCare-sourced column descriptions in <SQL_SCHEMA> — see _build_sql_schema_block."""
     return _SQL_GENERATION_TEMPLATE.format(
-        user_prompt=user_message, table_guide=_TABLE_GUIDE, schema=_SQL_SCHEMA_BLOCK
+        user_prompt=user_message,
+        table_guide=_TABLE_GUIDE,
+        schema=_build_sql_schema_block(min_session_date, min_customer_created_date),
     )
 
 

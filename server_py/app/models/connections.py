@@ -21,6 +21,12 @@ class BigQueryConnection(Base):
     is_active: Mapped[bool | None] = mapped_column("is_active", Boolean, default=True)
     last_tested_at: Mapped[datetime | None] = mapped_column("last_tested_at", DateTime)
     created_at: Mapped[datetime] = mapped_column("created_at", DateTime, server_default=func.now())
+    # Computed once (chat_bot.data_availability.get_min_dates) and cached here permanently — the
+    # earliest date actually present in the raw autocare_ss.data/autocare_ss.stripe_customers
+    # tables, which (unlike stripe_ss.*) cannot be backfilled further into the past. NULL until
+    # first computed for this connection.
+    min_session_date: Mapped[datetime | None] = mapped_column("min_session_date", DateTime)
+    min_customer_created_date: Mapped[datetime | None] = mapped_column("min_customer_created_date", DateTime)
 
 
 class ConnectionSchema(Base):

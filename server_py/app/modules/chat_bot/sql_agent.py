@@ -30,7 +30,7 @@ import re
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 
-from app.modules.chat_bot import guardrails, prompts
+from app.modules.chat_bot import data_availability, guardrails, prompts
 from app.modules.chat_bot.config import (
     CHATBOT_ANSWER_ROWS_SAMPLE,
     CHATBOT_LIST_BREAKDOWN_MAX_COLUMNS,
@@ -280,9 +280,19 @@ def _sql_only_tools(mcp_tools: list[dict]) -> list[dict]:
     return filtered or mcp_tools
 
 
-def _build_initial_messages(conversation_history: list[dict] | None, message: str) -> list[dict]:
+def _build_initial_messages(
+    conversation_history: list[dict] | None,
+    message: str,
+    min_session_date: str | None,
+    min_customer_created_date: str | None,
+) -> list[dict]:
     messages: list[dict] = [
-        {"role": "system", "content": prompts.build_sql_generation_system_prompt(message)}
+        {
+            "role": "system",
+            "content": prompts.build_sql_generation_system_prompt(
+                message, min_session_date, min_customer_created_date
+            ),
+        }
     ]
     for turn in conversation_history or []:
         role = turn.get("role")
@@ -333,7 +343,11 @@ async def stream_single_query(
             return
 
         openai_format_tools = mcp_tools_to_openai_format(_sql_only_tools(mcp_tools))
-        messages = _build_initial_messages(conversation_history, message)
+        # Free (no BigQuery call) after the first-ever chat turn on this connection — see
+        # data_availability.py's module docstring for why this is safe to compute once and cache
+        # rather than refresh periodically.
+        min_session_date, min_customer_created_date = await data_availability.get_min_dates(db, connection)
+        messages = _build_initial_messages(conversation_history, message, min_session_date, min_customer_created_date)
         tables_used: list[str] = []
         # Set the moment a SQL tool call comes back with real rows — once this is populated
         # the round loop below breaks out and hands off to a SEPARATE answer-generation call
