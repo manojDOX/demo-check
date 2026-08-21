@@ -17,7 +17,7 @@ Public interface (depended on by sql_agent.py):
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -48,11 +48,25 @@ def _format_date(value) -> str | None:
     return str(value)[:10]
 
 
+def _to_naive_utc(value: datetime | date | None) -> datetime | date | None:
+    """BigQuery's client library returns TIMESTAMP columns as timezone-aware datetimes, but
+    bigquery_connections.min_session_date/min_customer_created_date are naive DateTime columns
+    (TIMESTAMP WITHOUT TIME ZONE, matching this codebase's existing convention — see repo.py's
+    touch_session/clear_session_history comments). Persisting an aware value straight through
+    breaks asyncpg's encoder ("can't subtract offset-naive and offset-aware datetimes"), so
+    convert to naive UTC first — the same normalization, just applied here instead of via
+    datetime.utcnow() since this value comes from BigQuery, not generated locally."""
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
 async def _query_min_date_raw(service: BigQueryService, sql_template: str, project_id: str):
-    """Returns the raw datetime/date value from BigQuery (suitable for persisting straight into
-    the DateTime column), or None on an empty/failed result. Uses the public execute_query (not
-    the MCP client — this reads the raw autocare_ss tables directly, not the semantic views the
-    chat pipeline queries through MCP) so the same SELECT-only safety validation applies."""
+    """Returns the raw datetime/date value from BigQuery, normalized to naive UTC (suitable for
+    persisting straight into the DateTime column), or None on an empty/failed result. Uses the
+    public execute_query (not the MCP client — this reads the raw autocare_ss tables directly,
+    not the semantic views the chat pipeline queries through MCP) so the same SELECT-only safety
+    validation applies."""
     try:
         result = await service.execute_query(sql_template.format(project_id=project_id), max_rows=1)
     except Exception as exc:  # noqa: BLE001 - best-effort, never blocks the chat turn
@@ -60,7 +74,7 @@ async def _query_min_date_raw(service: BigQueryService, sql_template: str, proje
         return None
     if not result.rows:
         return None
-    return result.rows[0].get("min_date")
+    return _to_naive_utc(result.rows[0].get("min_date"))
 
 
 async def get_min_dates(db: AsyncSession, connection: BigQueryConnection) -> tuple[str | None, str | None]:
