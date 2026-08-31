@@ -382,7 +382,18 @@ _TABLE_GUIDE = """- Question about a CUSTOMER as a person/account (who are they,
 - If a question could plausibly map to more than one table (e.g. "recent activity" could mean
   sessions or subscription changes), pick the interpretation that matches the literal words used
   (visit/session -> session_360_vw, subscription/plan/billing -> subscription_360_vw) and state
-  which one you used in your answer rather than silently picking one."""
+  which one you used in your answer rather than silently picking one.
+- Question combining PAYING (subscribed/billed) with NOT VISITING over some duration (e.g.
+  "customers paying for N months without visiting", "paying members who haven't come in") ->
+  answerable from customer_360_vw alone, no join needed. "Paying" = currently has an active
+  subscription that's been running at least that long: has_active_subscription = TRUE AND
+  current_period_end >= CURRENT_TIMESTAMP() (per the SUBSCRIPTION STATUS IS STALE rule) AND
+  subscription_tenure_days >= N * 30. "Without visiting" (for that same span) = either
+  last_session_date IS NULL (never visited at all) or last_session_date < a cutoff N * 30 days
+  before now (per NULL-SAFE FILTERING, remember to include the IS NULL case explicitly). There is
+  no per-month billing-cycle/payment-event table, so treat "N consecutive months" as this tenure +
+  recency threshold, not a literal month-by-month check — this is a reasonable, answerable
+  business question with the available columns, not out of scope."""
 
 _SQL_GENERATION_TEMPLATE = """You're an expert at SQL, working inside a BigQuery tool-calling agent. You will be
 given a business user's natural-language question about their own customer data, and a set of
