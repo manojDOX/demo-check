@@ -393,7 +393,15 @@ _TABLE_GUIDE = """- Question about a CUSTOMER as a person/account (who are they,
   before now (per NULL-SAFE FILTERING, remember to include the IS NULL case explicitly). There is
   no per-month billing-cycle/payment-event table, so treat "N consecutive months" as this tenure +
   recency threshold, not a literal month-by-month check — this is a reasonable, answerable
-  business question with the available columns, not out of scope."""
+  business question with the available columns, not out of scope.
+- Question about CHURN relative to a tenure threshold (e.g. "cancelled before completing N months
+  of membership", "churned within their first N months") -> subscription_360_vw. "Cancelled" =
+  is_cancelled_subscription = TRUE. Tenure AT cancellation is NOT subscription_age_days (that's
+  measured to now, not to when it cancelled) — compute it as
+  DATE_DIFF(COALESCE(canceled_at, ended_at), subscription_created_at, DAY) < N * 30, using
+  COALESCE since a given cancelled row may have one of canceled_at/ended_at set but not the other.
+  Per the ROW-COUNTING GOTCHAS rule, count COUNT(DISTINCT subscription_id), never COUNT(*). This
+  is answerable with the available columns, not out of scope."""
 
 _SQL_GENERATION_TEMPLATE = """You're an expert at SQL, working inside a BigQuery tool-calling agent. You will be
 given a business user's natural-language question about their own customer data, and a set of
