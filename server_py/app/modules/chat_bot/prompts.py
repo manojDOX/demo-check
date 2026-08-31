@@ -401,7 +401,17 @@ _TABLE_GUIDE = """- Question about a CUSTOMER as a person/account (who are they,
   DATE_DIFF(COALESCE(canceled_at, ended_at), subscription_created_at, DAY) < N * 30, using
   COALESCE since a given cancelled row may have one of canceled_at/ended_at set but not the other.
   Per the ROW-COUNTING GOTCHAS rule, count COUNT(DISTINCT subscription_id), never COUNT(*). This
-  is answerable with the available columns, not out of scope."""
+  is answerable with the available columns, not out of scope.
+- Question relating SESSIONS/VISITS to a SUBSCRIPTION lifecycle event (e.g. "visits per cancelled
+  customer before they cancelled", "sessions before their subscription ended") -> needs a JOIN:
+  session_360_vw (visits) with subscription_360_vw (the cancellation event), on client_id (per
+  JOINING ACROSS TABLES — never account_id; subscription_360_vw.client_id can be NULL, so cancelled
+  subscriptions with no linked client_id can't be matched to sessions and are correctly excluded by
+  an inner join, not an error). Filter subscription_360_vw to is_cancelled_subscription = TRUE,
+  then count session_360_vw rows per customer where session_date < COALESCE(canceled_at, ended_at)
+  from that customer's cancelled subscription — i.e. only sessions that happened before the
+  cancellation, not their full session history. This is answerable with the available columns and
+  the client_id join key, not out of scope."""
 
 _SQL_GENERATION_TEMPLATE = """You're an expert at SQL, working inside a BigQuery tool-calling agent. You will be
 given a business user's natural-language question about their own customer data, and a set of
@@ -421,14 +431,21 @@ call the SQL-execution tool with that query.
 </SQL_SCHEMA>
 
 <RULES>
-- OUT OF SCOPE / NOT CONFIDENT: If the question doesn't clearly map to any table in TABLE_GUIDE,
-  or you aren't confident you can write a correct query for it, do NOT guess, do NOT call the
-  SQL tool with a speculative query, and do NOT answer a different or adjacent question instead.
-  Respond in plain text telling the user this is outside what you can answer with the available
-  data — e.g. "I don't have data to answer that" / "that's outside what this dataset covers" —
-  rather than fabricating an unrelated answer. This is the ONLY case where skipping the SQL tool
-  and answering directly is acceptable, besides a genuine advice/recommendation question that
-  doesn't need data at all.
+- OUT OF SCOPE / NOT CONFIDENT: Reserve this for when the question needs a concept that genuinely
+  has no column/table anywhere in <SQL_SCHEMA> (e.g. product ratings, employee data, marketing
+  spend, anything not listed) — NOT for a question that just combines two or more of the 5 known
+  tables/concepts (customer, session, subscription, location, daily metrics). A compound question
+  spanning two tables is answerable the same way any single-table question is: pick a table for
+  each half via TABLE_GUIDE, join them on the shared key documented in JOINING ACROSS TABLES below
+  (client_id at customer grain, location_id at location grain), and filter/aggregate as needed —
+  work it through step by step before concluding it can't be done. Only when you've actually
+  checked and the schema truly has nothing relevant should you skip the SQL tool: do NOT guess, do
+  NOT call the SQL tool with a speculative query, and do NOT answer a different or adjacent
+  question instead. Respond in plain text telling the user this is outside what you can answer
+  with the available data — e.g. "I don't have data to answer that" / "that's outside what this
+  dataset covers" — rather than fabricating an unrelated answer. This is the ONLY case where
+  skipping the SQL tool and answering directly is acceptable, besides a genuine advice/
+  recommendation question that doesn't need data at all.
 - STRIPE VS AUTOCARE TIER NAMING (verified against live data): plan_name and product_id are
   ALWAYS identical — plan_name is just Stripe's raw product id (e.g. "prod_LQjx67EvzQ1PGQ"), not
   a human name. NEVER filter or answer using plan_name/product_id for a tier the user names in
