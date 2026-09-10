@@ -82,6 +82,8 @@ def _strip_markdown_formatting(text: str) -> str:
     if not text:
         return text
     text = _MD_HEADER_RE.sub("", text)
+    # Inline code spans aren't rendered either; in answers they only ever wrap raw column names.
+    text = text.replace("`", "")
     return text
 
 
@@ -643,7 +645,7 @@ async def stream_single_query(
         # itself. No tools offered here — this call only turns already-fetched rows into an
         # analyst-voice answer, it never queries anything itself. -----------------------
         summary: result_summary.CappedSummary | None = None
-        if successful_result["hit_row_cap"] and _is_list_shaped_sql(successful_result["sql"]):
+        if successful_result["hit_row_cap"]:
             yield {"type": "status", "label": "Counting all matching rows…"}
             summary = await _run_capped_summary(mcp, connection.project_id, successful_result)
         total_rows, unique_customers, total_exact = _result_totals(successful_result, summary)
@@ -662,8 +664,9 @@ async def stream_single_query(
         # `col=val` lines into the prompt for the model to narrate is wasteful and prone to the
         # model just enumerating rows back in prose. Small list results (e.g. "list the
         # subscription tiers" -> 3 rows) and aggregate-shaped results keep the existing row-sample
-        # path unchanged. See config.py's CHATBOT_LIST_SUMMARY_MIN_ROWS. A capped list result
-        # uses BigQuery's exact full-result summary instead (see result_summary.py).
+        # path unchanged. See config.py's CHATBOT_LIST_SUMMARY_MIN_ROWS. Any capped result (a plain
+        # list or a per-customer GROUP BY) uses BigQuery's exact full-result summary instead (see
+        # result_summary.py).
         if summary is not None:
             query_result_block = result_summary.format_summary_block(successful_result["sql"], summary)
         elif (
@@ -685,13 +688,13 @@ async def stream_single_query(
                 successful_result["sql"],
                 successful_result["columns"],
                 answer_sample,
-                successful_result["total_rows"],
-                successful_result["total_rows"] > len(answer_sample),
+                total_rows,
+                total_rows > len(answer_sample) or not total_exact,
+                total_exact,
             )
         if summary is None and successful_result.get("hit_row_cap"):
-            # Only reached when the exact full-result summary couldn't be computed (or the result
-            # isn't list-shaped). Either branch above may have stated the capped row count as if
-            # it were the total, so this overrides that.
+            # Only reached when the exact full-result summary query failed. Either branch above may
+            # have stated the capped row count as if it were the total, so this overrides that.
             query_result_block += (
                 f"\n\nNote: this query hit the query tool's per-call cap of {CHATBOT_MCP_ROW_CAP} rows "
                 "and the exact total couldn't be computed. Don't state a total count or percentages of "

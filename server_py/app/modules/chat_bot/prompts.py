@@ -625,13 +625,23 @@ for a decision, not a database echoing rows back.
 </RULES>"""
 
 
-def format_query_result_block(sql: str, columns: list[str], rows: list[dict], total_rows: int, truncated: bool) -> str:
+def format_query_result_block(
+    sql: str, columns: list[str], rows: list[dict], total_rows: int, truncated: bool, total_exact: bool = True
+) -> str:
     """Renders the SQL + returned rows into the <QUERY_RESULT> slot. Given to the model for
     context (so it understands what was actually queried), not shown to the end user — RULES
     above tells the model not to repeat the SQL/column names verbatim in its answer."""
     rows_text = "\n".join(", ".join(f"{col}={row.get(col)}" for col in columns) for row in rows) or "(no rows)"
-    truncated_note = f" (showing {len(rows)} of {total_rows} total rows)" if truncated else ""
-    return f"SQL executed:\n{sql}\n\nColumns: {', '.join(columns)}\n\nRows{truncated_note}:\n{rows_text}"
+    if truncated:
+        total = f"{total_rows:,}" if total_exact else f"more than {total_rows:,} (exact total unknown)"
+        # Small models were observed reporting the sample size as the result count.
+        rows_header = (
+            f"Total rows in the full result: {total}. The rows below are only a sample of the first "
+            f"{len(rows)} — never report {len(rows)} as the number of rows or customers:"
+        )
+    else:
+        rows_header = "Rows (complete result):"
+    return f"SQL executed:\n{sql}\n\nColumns: {', '.join(columns)}\n\n{rows_header}\n{rows_text}"
 
 
 def build_answer_generation_system_prompt(user_message: str, query_result_block: str) -> str:

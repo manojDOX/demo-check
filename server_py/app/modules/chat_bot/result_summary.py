@@ -25,7 +25,8 @@ _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SKIP_CATEGORY_RE = re.compile(
     r"(^id$|_id$|email|phone|^full_name$|^first_name$|^last_name$|^customer_name$)", re.IGNORECASE
 )
-_CATEGORY_TYPES = {"STRING", "BOOL", "BOOLEAN"}
+# Low-cardinality integers (e.g. a per-customer location_count) break down like categories.
+_CATEGORY_TYPES = {"STRING", "BOOL", "BOOLEAN", "INT64", "INTEGER"}
 _DATE_TYPES = {"DATE", "DATETIME", "TIMESTAMP"}
 _TOTAL_DIM = "__total__"
 _NULL_STRING = "CAST(NULL AS STRING)"
@@ -193,7 +194,10 @@ def parse_summary(plan: SummaryPlan, rows: list[dict]) -> CappedSummary | None:
 
 
 def _share(part: int, total: int) -> str:
-    return f"{part / total:.0%}" if total else "n/a"
+    if not total:
+        return "n/a"
+    share = part / total
+    return "<1%" if 0 < share < 0.005 else f"{share:.0%}"
 
 
 def format_summary_block(sql: str, summary: CappedSummary) -> str:
