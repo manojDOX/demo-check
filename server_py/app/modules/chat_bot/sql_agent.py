@@ -26,11 +26,12 @@ ever calling a tool.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 
-from app.modules.chat_bot import data_availability, drill_down, guardrails, prompts
+from app.modules.chat_bot import data_availability, drill_down, guardrails, prompts, result_summary
 from app.modules.chat_bot.config import (
     CHATBOT_ANSWER_ROWS_SAMPLE,
     CHATBOT_LIST_BREAKDOWN_MAX_COLUMNS,
@@ -47,6 +48,8 @@ from app.modules.chat_bot.llm_client import (
     messages_with_tool_result,
 )
 from app.modules.chat_bot.mcp_client import BigQueryMCPClient
+
+logger = logging.getLogger(__name__)
 
 # Tool names that execute SQL against BigQuery — SQL-safety interception (guardrails.
 # check_sql_safety) applies to these before the tool is actually called. The real hosted
@@ -267,6 +270,41 @@ def _infer_charts(fields: list[dict], data: list[dict]) -> list[dict]:
             "y_label": _humanize_column(y_field),
         }
     ]
+
+
+async def _run_capped_summary(mcp, project_id: str, result: dict) -> result_summary.CappedSummary | None:
+    """One extra query computing exact totals/breakdowns over a capped result's full row set.
+    Best-effort: any failure returns None and the answer falls back to the capped rows."""
+    plan = result_summary.plan_summary(result["sql"], result["fields"], result["full_data"])
+    is_safe, reason = guardrails.check_sql_safety(plan.sql)
+    if not is_safe:
+        logger.warning("Capped-result summary query failed the SQL safety check: %s", reason)
+        return None
+    try:
+        response = await mcp.call_tool(result["tool_name"], {"projectId": project_id, "query": plan.sql})
+    except Exception:
+        logger.warning("Capped-result summary query failed", exc_info=True)
+        return None
+    structured = response.get("structuredContent") if isinstance(response, dict) else None
+    if (isinstance(response, dict) and response.get("isError")) or not _looks_like_bq_rows(structured):
+        logger.warning("Capped-result summary query returned an error or no rows: %s", response)
+        return None
+    _, rows, _ = _parse_bq_rows(structured)
+    return result_summary.parse_summary(plan, rows)
+
+
+def _result_totals(result: dict, summary: result_summary.CappedSummary | None) -> tuple[int, int | None, bool]:
+    """(total_rows, unique_customers, total_exact) for the result as a whole."""
+    if summary is not None:
+        return summary.total_rows, summary.unique_customers, True
+    if result["hit_row_cap"]:
+        return len(result["full_data"]), None, False
+    total_rows = result["total_rows"]
+    client_column = next((c for c in result["columns"] if c.lower() == "client_id"), None)
+    unique_customers = None
+    if client_column and total_rows <= len(result["full_data"]):
+        unique_customers = len({row.get(client_column) for row in result["full_data"] if row.get(client_column)})
+    return total_rows, unique_customers, True
 
 
 def _done_event(billable: bool, confidence: float, tables_used: list[str]) -> dict:
@@ -526,6 +564,8 @@ async def stream_single_query(
                                     "total_rows": total_rows,
                                     "truncated": truncated,
                                     "hit_row_cap": hit_row_cap,
+                                    "fields": fields,
+                                    "tool_name": name,
                                     # Only trustworthy when the full matching set was actually
                                     # retrieved — a range computed from a partial/capped result
                                     # would understate true coverage, so this is populated here
@@ -572,14 +612,31 @@ async def stream_single_query(
         # rather than letting the step-1 tool-calling conversation produce the final text
         # itself. No tools offered here — this call only turns already-fetched rows into an
         # analyst-voice answer, it never queries anything itself. -----------------------
+        summary: result_summary.CappedSummary | None = None
+        if successful_result["hit_row_cap"] and _is_list_shaped_sql(successful_result["sql"]):
+            yield {"type": "status", "label": "Counting all matching rows…"}
+            summary = await _run_capped_summary(mcp, connection.project_id, successful_result)
+        total_rows, unique_customers, total_exact = _result_totals(successful_result, summary)
+        # The `rows` event above carried the MCP tool's own total, which isn't reliable once
+        # capped — this corrects it for the UI (card banner, drill breadcrumb) and persistence.
+        yield {
+            "type": "row_count",
+            "total_rows": total_rows,
+            "unique_customers": unique_customers,
+            "total_exact": total_exact,
+        }
+
         yield {"type": "status", "label": "Writing your answer…"}
         # List-shaped results (raw entities, no COUNT/SUM/AVG/GROUP BY) above the row threshold
         # get a Python-computed aggregate breakdown instead of a row sample — dumping hundreds of
         # `col=val` lines into the prompt for the model to narrate is wasteful and prone to the
         # model just enumerating rows back in prose. Small list results (e.g. "list the
         # subscription tiers" -> 3 rows) and aggregate-shaped results keep the existing row-sample
-        # path unchanged. See config.py's CHATBOT_LIST_SUMMARY_MIN_ROWS.
-        if (
+        # path unchanged. See config.py's CHATBOT_LIST_SUMMARY_MIN_ROWS. A capped list result
+        # uses BigQuery's exact full-result summary instead (see result_summary.py).
+        if summary is not None:
+            query_result_block = result_summary.format_summary_block(successful_result["sql"], summary)
+        elif (
             _is_list_shaped_sql(successful_result["sql"])
             and successful_result["total_rows"] > CHATBOT_LIST_SUMMARY_MIN_ROWS
         ):
@@ -601,17 +658,20 @@ async def stream_single_query(
                 successful_result["total_rows"],
                 successful_result["total_rows"] > len(answer_sample),
             )
-        if successful_result.get("hit_row_cap"):
-            # Both branches above may have already stated `total_rows` as if it were exact — it
-            # isn't, once the MCP tool's own row cap is hit (see the hit_row_cap comment where
-            # it's computed). Append this regardless of which branch ran, so the model can't
-            # present the capped count as a final total either way.
+        if summary is None and successful_result.get("hit_row_cap"):
+            # Only reached when the exact full-result summary couldn't be computed (or the result
+            # isn't list-shaped). Either branch above may have stated the capped row count as if
+            # it were the total, so this overrides that.
             query_result_block += (
-                f"\n\nNote: this query hit the query tool's per-call cap of {CHATBOT_MCP_ROW_CAP} "
-                f"rows — at least {len(successful_result['full_data'])} rows matched, but the true "
-                "total could be higher and is not knowable from this result. Say so plainly if you "
-                "report a count from this data (e.g. \"at least N\", not a bare total) — do not "
-                "state the capped number as if it were the complete total."
+                f"\n\nNote: this query hit the query tool's per-call cap of {CHATBOT_MCP_ROW_CAP} rows "
+                "and the exact total couldn't be computed. Don't state a total count or percentages of "
+                "the whole; describe what the retrieved rows show and say plainly that the full result is "
+                "larger than what was retrieved."
+            )
+        if summary is None and unique_customers is not None:
+            query_result_block += (
+                f"\n\nUnique customers (distinct client_id) in this result: {unique_customers:,} "
+                f"across {total_rows:,} rows."
             )
         if drill is not None:
             query_result_block += drill_down.build_answer_note(drill)
@@ -639,9 +699,16 @@ async def stream_single_query(
             successful_result["total_rows"] <= len(successful_result["full_data"])
             and not successful_result.get("hit_row_cap")
         )
-        if content and date_range and full_data_complete:
+        if content and summary is not None and summary.min_date and summary.max_date:
+            content += f"\n\nThis response is based on data from {summary.min_date} to {summary.max_date}."
+        elif content and date_range and full_data_complete:
             _, min_value, max_value = date_range
             content += f"\n\nThis response is based on data from {min_value} to {max_value}."
+        shown_rows = len(successful_result["data"])
+        if content and total_rows > shown_rows:
+            content += "\n\n" + result_summary.build_partial_list_note(
+                shown_rows, total_rows, total_exact, unique_customers
+            )
         if content:
             yield {"type": "text", "content": content}
         else:

@@ -79,6 +79,10 @@ interface QueryResultProps {
   recommendation?: string;
   onDrillDown?: () => void;
   isDrillDownMode?: boolean;
+  // True size of the result; `data` may be only the first slice of it.
+  totalRows?: number;
+  uniqueCustomers?: number | null;
+  totalExact?: boolean;
 }
 
 const CHART_COLORS = [
@@ -143,6 +147,9 @@ export function QueryResult({
   recommendation,
   onDrillDown,
   isDrillDownMode = false,
+  totalRows,
+  uniqueCustomers = null,
+  totalExact = true,
 }: QueryResultProps) {
   const [vizType, setVizType] = useState<VisualizationType>(initialType);
   const [isSaved, setIsSaved] = useState(initialSaved);
@@ -1058,6 +1065,20 @@ export function QueryResult({
 
           {!isRecommendation && (
           <>
+          {totalRows !== undefined && data.length > 0 && totalRows > data.length && (
+            <div
+              className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-900 dark:text-amber-200"
+              data-testid="partial-result-banner"
+            >
+              <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+              <span>
+                Showing {data.length.toLocaleString()} of {totalExact ? "" : "more than "}
+                {totalRows.toLocaleString()} rows
+                {uniqueCustomers !== null ? ` (${uniqueCustomers.toLocaleString()} unique customers)` : ""}. The table,
+                CSV, Crear Segmento and Send to GHL include only these {data.length.toLocaleString()} rows.
+              </span>
+            </div>
+          )}
           <div className="flex items-center justify-between gap-4 flex-wrap">
             <div className="flex items-center gap-1 p-1 bg-muted rounded-lg">
               {[

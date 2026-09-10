@@ -100,9 +100,6 @@ function mapChartType(rows: ChatRowsPayload | null): VisualizationType {
   }
 }
 
-// Mirrors CHATBOT_MCP_ROW_CAP in server_py/app/modules/chat_bot/config.py.
-const MCP_ROW_CAP = 3000;
-
 interface DrillStep {
   id: string;
   question: string;
@@ -127,7 +124,7 @@ function canDrill(step: Pick<DrillStep, "sql" | "sqlToken" | "rows">): boolean {
 
 function formatRowCount(rows: ChatRowsPayload): string {
   const count = rows.totalRows.toLocaleString();
-  return rows.truncated && rows.totalRows >= MCP_ROW_CAP ? `${count}+` : count;
+  return rows.totalExact ? count : `${count}+`;
 }
 
 export default function QueryPage() {
@@ -588,6 +585,9 @@ export default function QueryPage() {
             sql={stream.sql ?? undefined}
             visualizationType={mapChartType(stream.rows)}
             isStreaming={stream.isStreaming}
+            totalRows={stream.rows?.totalRows}
+            uniqueCustomers={stream.rows?.uniqueCustomers ?? null}
+            totalExact={stream.rows?.totalExact ?? true}
           />
         </div>
       )}
@@ -636,6 +636,9 @@ export default function QueryPage() {
           sql={activeDrillStep.sql ?? undefined}
           visualizationType={mapChartType(activeDrillStep.rows)}
           clientId={selectedClientId}
+          totalRows={activeDrillStep.rows?.totalRows}
+          uniqueCustomers={activeDrillStep.rows?.uniqueCustomers ?? null}
+          totalExact={activeDrillStep.rows?.totalExact ?? true}
         />
       )}
 
@@ -658,6 +661,9 @@ export default function QueryPage() {
             sql={turn.sql ?? undefined}
             visualizationType={mapChartType(turn.rows)}
             clientId={selectedClientId}
+            totalRows={turn.rows?.totalRows}
+            uniqueCustomers={turn.rows?.uniqueCustomers ?? null}
+            totalExact={turn.rows?.totalExact ?? true}
             onDrillDown={canDrill(turn) && !chat.isStreaming ? () => handleDrillDown(turn) : undefined}
           />
         </div>

@@ -228,6 +228,10 @@ async def stream_chat(
         elif event_type == "rows":
             final_rows_payload = {k: v for k, v in event.items() if k != "type"}
             yield event
+        elif event_type == "row_count":
+            if final_rows_payload is not None:
+                final_rows_payload.update({k: v for k, v in event.items() if k != "type"})
+            yield event
         elif event_type == "text":
             answer_parts.append(event.get("content") or "")
             yield event
@@ -347,6 +351,8 @@ async def stream_drill_step(
                 final_tables_used = event["tables_used"]
         elif event_type == "rows":
             final_rows_payload = {k: v for k, v in event.items() if k != "type"}
+        elif event_type == "row_count" and final_rows_payload is not None:
+            final_rows_payload.update({k: v for k, v in event.items() if k != "type"})
         yield event
 
     if _should_bill(billable, final_confidence):

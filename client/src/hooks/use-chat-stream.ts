@@ -23,6 +23,9 @@ export interface ChatRowsPayload {
   data: Array<Record<string, unknown>>;
   totalRows: number;
   truncated: boolean;
+  uniqueCustomers: number | null;
+  // False only when the query hit the BigQuery row cap and the exact total couldn't be computed.
+  totalExact: boolean;
   viz: {
     showTable: boolean;
     charts: ChatChartConfig[];
@@ -43,6 +46,8 @@ type RawRowsEvent = {
   data: Array<Record<string, unknown>>;
   total_rows: number;
   truncated: boolean;
+  unique_customers?: number | null;
+  total_exact?: boolean;
   viz: { show_table: boolean; charts: Array<Record<string, unknown>> };
 };
 
@@ -51,9 +56,13 @@ type RawSseEvent =
   | { type: "status"; label: string }
   | { type: "sql"; content: string; tables_used: string[] }
   | RawRowsEvent
+  | { type: "row_count"; total_rows: number; unique_customers: number | null; total_exact: boolean }
   | { type: "text"; content: string }
   | { type: "error"; content: string }
   | { type: "done"; confidence: number; tables_used: string[]; session_id: string; sql_token?: string | null };
+
+// Mirrors CHATBOT_MCP_ROW_CAP in server_py/app/modules/chat_bot/config.py.
+const MCP_ROW_CAP = 3000;
 
 function normalizeChart(raw: Record<string, unknown>): ChatChartConfig {
   const { x_field, y_field, x_label, y_label, ...rest } = raw as Record<string, unknown>;
@@ -73,6 +82,9 @@ function normalizeRows(evt: RawRowsEvent): ChatRowsPayload {
     data: evt.data ?? [],
     totalRows: evt.total_rows ?? 0,
     truncated: Boolean(evt.truncated),
+    uniqueCustomers: evt.unique_customers ?? null,
+    // Messages saved before exact totals existed: a capped result's total is unknown.
+    totalExact: evt.total_exact ?? !(evt.truncated && (evt.total_rows ?? 0) >= MCP_ROW_CAP),
     viz: {
       showTable: Boolean(evt.viz?.show_table),
       charts: (evt.viz?.charts ?? []).map(normalizeChart),
@@ -239,6 +251,21 @@ export function useChatStream(endpoint: string = "/api/chat/stream"): UseChatStr
               case "rows":
                 setRows(normalizeRows(event));
                 break;
+              case "row_count": {
+                const { total_rows, unique_customers, total_exact } = event;
+                setRows((prev) =>
+                  prev
+                    ? {
+                        ...prev,
+                        totalRows: total_rows,
+                        uniqueCustomers: unique_customers,
+                        totalExact: total_exact,
+                        truncated: total_rows > prev.data.length,
+                      }
+                    : prev,
+                );
+                break;
+              }
               case "text":
                 setText((prev) => prev + event.content);
                 break;
