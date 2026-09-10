@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 
 from app.modules.chat_bot import data_availability, drill_down, guardrails, prompts, result_summary
 from app.modules.chat_bot.config import (
+    CHATBOT_ANSWER_MAX_TOKENS,
     CHATBOT_ANSWER_ROWS_SAMPLE,
     CHATBOT_LIST_BREAKDOWN_MAX_COLUMNS,
     CHATBOT_LIST_BREAKDOWN_MAX_VALUES,
@@ -40,6 +41,7 @@ from app.modules.chat_bot.config import (
     CHATBOT_MAX_TOOL_RESULT_CHARS,
     CHATBOT_MAX_TOOL_ROUNDS,
     CHATBOT_MCP_ROW_CAP,
+    CHATBOT_SQL_MAX_TOKENS,
     CHATBOT_TOOL_ECHO_ROW_SAMPLE,
 )
 from app.modules.chat_bot.llm_client import (
@@ -50,6 +52,15 @@ from app.modules.chat_bot.llm_client import (
 from app.modules.chat_bot.mcp_client import BigQueryMCPClient
 
 logger = logging.getLogger(__name__)
+
+# finish_reason values meaning "ran out of output tokens" (OpenAI/OpenRouter, Anthropic, Gemini).
+_LENGTH_FINISH_REASONS = {"length", "max_tokens", "MAX_TOKENS"}
+
+_EMPTY_RESPONSE_NUDGE = (
+    "Your previous reply was empty — no text and no tool call. Call the SQL-execution tool with a single "
+    "query that answers the question, or, only if it genuinely can't be answered from the schema, reply in "
+    "plain text saying so."
+)
 
 # Tool names that execute SQL against BigQuery — SQL-safety interception (guardrails.
 # check_sql_safety) applies to these before the tool is actually called. The real hosted
@@ -405,38 +416,57 @@ async def stream_single_query(
         # tool-calling conversation produce the final text itself. Stays None through
         # tool-call errors/retries, so those still loop normally within step 1.
         successful_result: dict | None = None
+        retried_empty_response = False
+        sql_max_tokens = CHATBOT_SQL_MAX_TOKENS
 
         status_labels = ["Thinking…", "Looking up your data…", "Analyzing your question…"]
 
         for round_idx in range(CHATBOT_MAX_TOOL_ROUNDS):
             yield {"type": "status", "label": status_labels[min(round_idx, len(status_labels) - 1)]}
             try:
-                # This step's output is just a SQL string passed as a tool-call argument (or,
-                # in the out-of-scope branch, a short plain-text refusal) — not free-form
-                # prose. Even a query with several CTEs/JOINs rarely runs past a few hundred
-                # tokens, so this only needs headroom for an unusually long query, not the
-                # 3000 carried over from the reference implementation's answer-writing budget.
+                # The visible output is just a SQL tool-call argument, but reasoning models spend
+                # part of this budget thinking first — see CHATBOT_SQL_MAX_TOKENS in config.py.
                 response = await call_llm_with_tools(
-                    provider, model, api_key, messages, openai_format_tools, max_tokens=1000, temperature=0.2
+                    provider, model, api_key, messages, openai_format_tools, max_tokens=sql_max_tokens, temperature=0.2
                 )
             except Exception as error:
                 yield {"type": "error", "content": f"Couldn't get a response from the model: {error}"}
                 yield _done_event(False, 0.0, tables_used)
                 return
 
-            messages.append(response["raw_message"])
             tool_calls = response.get("tool_calls")
+            content = _strip_markdown_formatting((response.get("content") or "").strip())
+
+            if not tool_calls and not content:
+                # No text AND no tool call is a provider-side failure (e.g. a malformed function
+                # call or exhausted output tokens), not a considered "can't answer" — a real
+                # refusal comes back as text. Retry once rather than reporting "no data".
+                logger.warning(
+                    "Model returned an empty response (provider=%s, model=%s, finish_reason=%s, round=%d)",
+                    provider,
+                    model,
+                    response.get("finish_reason"),
+                    round_idx,
+                )
+                if not retried_empty_response:
+                    retried_empty_response = True
+                    if response.get("finish_reason") in _LENGTH_FINISH_REASONS:
+                        sql_max_tokens *= 2
+                    messages.append({"role": "user", "content": _EMPTY_RESPONSE_NUDGE})
+                    continue
+                yield {
+                    "type": "text",
+                    "content": "The AI model returned an empty response, so I couldn't answer that. "
+                    "Please try rephrasing the question.",
+                }
+                yield _done_event(False, 0.2, tables_used)
+                return
+
+            messages.append(response["raw_message"])
 
             if not tool_calls:
-                content = _strip_markdown_formatting((response.get("content") or "").strip())
-                if content:
-                    yield {"type": "text", "content": content}
-                else:
-                    yield {
-                        "type": "text",
-                        "content": "I couldn't find relevant data to answer that question.",
-                    }
-                yield _done_event(True, 0.8 if content else 0.2, tables_used)
+                yield {"type": "text", "content": content}
+                yield _done_event(True, 0.8, tables_used)
                 return
 
             # --- Tool-call round ----------------------------------------------------
@@ -681,7 +711,7 @@ async def stream_single_query(
         ]
         try:
             answer_response = await call_llm_with_tools(
-                provider, model, api_key, answer_messages, [], max_tokens=1500, temperature=0.3
+                provider, model, api_key, answer_messages, [], max_tokens=CHATBOT_ANSWER_MAX_TOKENS, temperature=0.3
             )
         except Exception as error:
             yield {"type": "error", "content": f"Couldn't get a response from the model: {error}"}

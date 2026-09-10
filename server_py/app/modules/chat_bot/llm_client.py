@@ -112,7 +112,6 @@ _NON_CHAT_MODEL_MARKERS = (
 # prompt payload routinely exceeds the default 3000-token budget for Gemini and leaves
 # the response truncated mid tool-call. Applied in _gemini_tools_call.
 _GEMINI_MIN_MAX_TOKENS = 6000
-_DEFAULT_CALL_MAX_TOKENS = 3000
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +339,12 @@ async def _openai_compat_tools_call(
                 arguments = {}
             tool_calls.append({"id": call.id, "name": call.function.name, "arguments": arguments})
 
-    return {"content": message.content, "tool_calls": tool_calls, "raw_message": raw_message}
+    return {
+        "content": message.content,
+        "tool_calls": tool_calls,
+        "raw_message": raw_message,
+        "finish_reason": resp.choices[0].finish_reason,
+    }
 
 
 def _anthropic_tools_from_openai_format(tools: list[dict]) -> list[dict]:
@@ -384,7 +388,7 @@ async def _anthropic_tools_call(
     # the next call — the SDK accepts the response's own `.content` list directly.
     raw_message = {"role": "assistant", "content": resp.content}
     content = "".join(text_parts) if text_parts else None
-    return {"content": content, "tool_calls": tool_calls, "raw_message": raw_message}
+    return {"content": content, "tool_calls": tool_calls, "raw_message": raw_message, "finish_reason": resp.stop_reason}
 
 
 def _gemini_tools_from_openai_format(tools: list[dict]) -> list:
@@ -420,7 +424,7 @@ async def _gemini_tools_call(
     model: str, api_key: str, messages: list[dict], tools: list[dict], max_tokens: int, temperature: float
 ) -> dict:
     genai.configure(api_key=api_key)
-    effective_max_tokens = max_tokens if max_tokens > _DEFAULT_CALL_MAX_TOKENS else _GEMINI_MIN_MAX_TOKENS
+    effective_max_tokens = max(max_tokens, _GEMINI_MIN_MAX_TOKENS)
 
     system_text, rest = _split_system(messages)
     generation_config = genai.types.GenerationConfig(max_output_tokens=effective_max_tokens, temperature=temperature)
@@ -437,6 +441,12 @@ async def _gemini_tools_call(
     tool_calls = None
     raw_parts: list[dict] = []
     if candidate is not None:
+        reason = getattr(candidate, "finish_reason", None)
+        finish_reason = getattr(reason, "name", None) or (str(reason) if reason is not None else None)
+    else:
+        block = getattr(getattr(resp, "prompt_feedback", None), "block_reason", None)
+        finish_reason = f"BLOCKED:{getattr(block, 'name', block)}" if block else "NO_CANDIDATES"
+    if candidate is not None and candidate.content is not None:
         for part in candidate.content.parts:
             fc = getattr(part, "function_call", None)
             if fc and getattr(fc, "name", None):
@@ -453,7 +463,7 @@ async def _gemini_tools_call(
 
     raw_message = {"role": "model", "content": raw_parts}
     content = "".join(text_parts) if text_parts else None
-    return {"content": content, "tool_calls": tool_calls, "raw_message": raw_message}
+    return {"content": content, "tool_calls": tool_calls, "raw_message": raw_message, "finish_reason": finish_reason}
 
 
 def messages_with_tool_result(

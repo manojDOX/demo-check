@@ -149,6 +149,8 @@ export default function QueryPage() {
   const drillChat = useChatStream("/api/chat/drill/stream");
   const [drill, setDrill] = useState<DrillState | null>(null);
   const [drillQuestion, setDrillQuestion] = useState("");
+  // A drill question that produced no result table: shown as a notice, never added as a step.
+  const [drillNotice, setDrillNotice] = useState<{ question: string; text: string } | null>(null);
 
   const { data: connections, isLoading: isLoadingConnections } = useQuery<BigQueryConnection[]>({
     queryKey: ["/api/connections"],
@@ -205,6 +207,13 @@ export default function QueryPage() {
   // steps after it (a new branch).
   useEffect(() => {
     if (!drillChat.done || drillChat.error) return;
+    if (!drillChat.rows) {
+      setDrillNotice({ question: drillQuestion, text: drillChat.text });
+      setDrillQuestion("");
+      drillChat.reset();
+      return;
+    }
+    setDrillNotice(null);
     setDrill((prev) => {
       if (!prev) return prev;
       const steps = [
@@ -249,6 +258,7 @@ export default function QueryPage() {
         });
         return;
       }
+      setDrillNotice(null);
       setDrillQuestion(question);
       drillChat.send(question, {
         sessionId,
@@ -274,6 +284,7 @@ export default function QueryPage() {
   const handleDrillDown = (turn: ConversationTurn) => {
     drillChat.reset();
     setDrillQuestion("");
+    setDrillNotice(null);
     setDrill({
       steps: [
         {
@@ -292,12 +303,14 @@ export default function QueryPage() {
   const handleDrillNavigate = (index: number) => {
     if (drillChat.isStreaming) return;
     drillChat.reset();
+    setDrillNotice(null);
     setDrill((prev) => (prev ? { ...prev, activeIndex: index } : prev));
   };
 
   const handleExitDrill = () => {
     drillChat.reset();
     setDrillQuestion("");
+    setDrillNotice(null);
     setDrill(null);
   };
 
@@ -622,6 +635,23 @@ export default function QueryPage() {
                 )}
                 Retry
               </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {drill && drillNotice && !stream.isStreaming && (
+        <Card className="border-amber-500/40 bg-amber-500/5" data-testid="drill-notice">
+          <CardContent className="pt-5 pb-5">
+            <div className="flex items-start gap-3">
+              <AlertCircle className="h-5 w-5 text-amber-600 shrink-0 mt-0.5" />
+              <div className="min-w-0">
+                <p className="font-medium">Couldn't narrow the segment with "{drillNotice.question}"</p>
+                <p className="text-sm text-muted-foreground mt-0.5">
+                  {drillNotice.text || "No result was returned."} The segment below is unchanged, so you can
+                  rephrase and try again.
+                </p>
+              </div>
             </div>
           </CardContent>
         </Card>

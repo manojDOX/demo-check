@@ -13,6 +13,13 @@ BQ_OAUTH_SCOPE = "https://www.googleapis.com/auth/bigquery"
 # implementation's MAX_TOOL_ROUNDS).
 CHATBOT_MAX_TOOL_ROUNDS = 8
 
+# Output-token budgets for the SQL-writing (tool-calling) and answer-writing LLM calls. Sized for
+# reasoning models (e.g. gpt-oss via OpenRouter), whose hidden reasoning counts against the same
+# budget before any SQL or text is produced — a 1000-token cap was observed to be exhausted on a
+# drill-down join, returning an empty reply. Unused budget costs nothing.
+CHATBOT_SQL_MAX_TOKENS = 4000
+CHATBOT_ANSWER_MAX_TOKENS = 4000
+
 # A tool result fed back to the LLM larger than this is truncated (mirrors the reference
 # implementation's MAX_TOOL_RESULT_CHARS).
 CHATBOT_MAX_TOOL_RESULT_CHARS = 20000

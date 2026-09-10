@@ -459,6 +459,11 @@ call the SQL-execution tool with that query.
   if a user says "Connect" without specifying which, filter on tier_name (LIKE '%Road
   Assistance%') to match both rather than guessing one, or ask which. If a user says "Pro" or
   "Premium", that means tier_name 'Unlimited Premium Wash'; "Basic" means 'Unlimited Basic Wash'.
+  tier_name holds exactly the four verified values above, so once the user's words map to one of
+  them, compare with exact equality (e.g. tier_name = 'Unlimited Basic Wash') — an exception to
+  STRING EQUALITY below. Don't use LIKE for a single tier: LIKE '%basic wash%' or '%unlimited basic
+  wash%' also matches both Road Assistance tiers. LIKE on tier_name is only for the deliberate
+  multi-tier case above ('%Road Assistance%').
 - STRING EQUALITY: Never use exact `=` to filter a free-text/string column against a
   user-provided name, label, or keyword — casing and spelling in the data won't reliably match
   what the user typed. Use `LOWER(col) LIKE LOWER('%term%')` (or `REGEXP_CONTAINS`) instead.
