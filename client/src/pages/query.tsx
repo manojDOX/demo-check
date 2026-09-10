@@ -34,6 +34,8 @@ import {
   Loader2,
   Plus,
   Eraser,
+  Filter,
+  ChevronRight,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import type { BigQueryConnection } from "@shared/schema";
@@ -59,6 +61,7 @@ interface ChatMessageRecord {
   confidence: number | null;
   tablesUsed: string[] | null;
   rows: unknown;
+  sqlToken?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -71,6 +74,7 @@ interface ConversationTurn {
   rows: ChatRowsPayload | null;
   confidence: number | null;
   tablesUsed: string[];
+  sqlToken: string | null;
   // Set on the first turn asked right after a "Clear History" click, so the transcript can
   // show a divider there — the turn itself and everything after it stays fully visible,
   // only what's sent to the LLM as context resets at this point.
@@ -96,6 +100,36 @@ function mapChartType(rows: ChatRowsPayload | null): VisualizationType {
   }
 }
 
+// Mirrors CHATBOT_MCP_ROW_CAP in server_py/app/modules/chat_bot/config.py.
+const MCP_ROW_CAP = 3000;
+
+interface DrillStep {
+  id: string;
+  question: string;
+  summary: string;
+  sql: string | null;
+  sqlToken: string | null;
+  rows: ChatRowsPayload | null;
+}
+
+interface DrillState {
+  steps: DrillStep[];
+  activeIndex: number;
+}
+
+// Follow-up steps join other views on client_id, so only customer-level results with a
+// server-signed SQL can be narrowed.
+function canDrill(step: Pick<DrillStep, "sql" | "sqlToken" | "rows">): boolean {
+  return Boolean(
+    step.sql && step.sqlToken && step.rows?.columns.some((column) => column.toLowerCase() === "client_id"),
+  );
+}
+
+function formatRowCount(rows: ChatRowsPayload): string {
+  const count = rows.totalRows.toLocaleString();
+  return rows.truncated && rows.totalRows >= MCP_ROW_CAP ? `${count}+` : count;
+}
+
 export default function QueryPage() {
   const [location] = useLocation();
   const [selectedClientId, setSelectedClientId] = useState<number | null>(null);
@@ -114,6 +148,10 @@ export default function QueryPage() {
   const initialQuery = urlParams.get("q") || "";
 
   const chat = useChatStream();
+  // Separate stream so the chat's own state is untouched while drilling; Exit restores it as-is.
+  const drillChat = useChatStream("/api/chat/drill/stream");
+  const [drill, setDrill] = useState<DrillState | null>(null);
+  const [drillQuestion, setDrillQuestion] = useState("");
 
   const { data: connections, isLoading: isLoadingConnections } = useQuery<BigQueryConnection[]>({
     queryKey: ["/api/connections"],
@@ -155,6 +193,7 @@ export default function QueryPage() {
         rows: chat.rows,
         confidence: chat.confidence,
         tablesUsed: chat.tablesUsed,
+        sqlToken: chat.sqlToken,
         historyClearedBefore: pendingHistoryClear,
       },
     ]);
@@ -164,6 +203,30 @@ export default function QueryPage() {
     chat.reset();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chat.done]);
+
+  // A finished drill step becomes the newest step. Asking from an earlier breadcrumb drops the
+  // steps after it (a new branch).
+  useEffect(() => {
+    if (!drillChat.done || drillChat.error) return;
+    setDrill((prev) => {
+      if (!prev) return prev;
+      const steps = [
+        ...prev.steps.slice(0, prev.activeIndex + 1),
+        {
+          id: `drill-${Date.now()}`,
+          question: drillQuestion,
+          summary: drillChat.text,
+          sql: drillChat.sql,
+          sqlToken: drillChat.sqlToken,
+          rows: drillChat.rows,
+        },
+      ];
+      return { steps, activeIndex: steps.length - 1 };
+    });
+    setDrillQuestion("");
+    drillChat.reset();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [drillChat.done]);
 
   // Defer initial ?q= query until connections are loaded and one is selected
   const [hasRunInitialQuery, setHasRunInitialQuery] = useState(false);
@@ -179,12 +242,66 @@ export default function QueryPage() {
   }, [initialQuery, hasRunInitialQuery, isLoadingConnections, connections, selectedConnectionId]);
 
   const handleAsk = (question: string) => {
+    if (drill) {
+      const base = drill.steps[drill.activeIndex];
+      if (!canDrill(base) || !sessionId) {
+        toast({
+          title: "Can't narrow this step",
+          description: "This result isn't a customer list. Pick an earlier step or exit the drill-down.",
+          variant: "destructive",
+        });
+        return;
+      }
+      setDrillQuestion(question);
+      drillChat.send(question, {
+        sessionId,
+        extraBody: {
+          baseSql: base.sql,
+          baseToken: base.sqlToken,
+          baseColumns: base.rows?.columns ?? [],
+          chain: drill.steps
+            .slice(0, drill.activeIndex + 1)
+            .map((step) => ({ question: step.question, rowCount: step.rows?.totalRows ?? null })),
+        },
+      });
+      return;
+    }
     setCurrentQuestion(question);
     chat.send(question, {
       sessionId,
       clientId: selectedClientId,
       connectionId: selectedConnectionId,
     });
+  };
+
+  const handleDrillDown = (turn: ConversationTurn) => {
+    drillChat.reset();
+    setDrillQuestion("");
+    setDrill({
+      steps: [
+        {
+          id: turn.id,
+          question: turn.question,
+          summary: turn.summary,
+          sql: turn.sql,
+          sqlToken: turn.sqlToken,
+          rows: turn.rows,
+        },
+      ],
+      activeIndex: 0,
+    });
+  };
+
+  const handleDrillNavigate = (index: number) => {
+    if (drillChat.isStreaming) return;
+    drillChat.reset();
+    setDrill((prev) => (prev ? { ...prev, activeIndex: index } : prev));
+  };
+
+  const handleExitDrill = () => {
+    drillChat.reset();
+    setDrillQuestion("");
+    setDrill(null);
   };
 
   const handleNewChat = () => {
@@ -219,6 +336,7 @@ export default function QueryPage() {
             rows: normalizeChatRows(next.rows),
             confidence: next.confidence ?? null,
             tablesUsed: next.tablesUsed ?? [],
+            sqlToken: next.sqlToken ?? null,
           });
           i++;
         } else {
@@ -230,6 +348,7 @@ export default function QueryPage() {
             rows: null,
             confidence: null,
             tablesUsed: [],
+            sqlToken: null,
           });
         }
       }
@@ -277,7 +396,10 @@ export default function QueryPage() {
   const recentQueries = [...turns].reverse().map((t) => t.question).slice(0, 5);
   const orderedTurns = [...turns].reverse();
 
-  const hasLiveContent = Boolean(chat.sql || chat.rows || chat.text);
+  const stream = drill ? drillChat : chat;
+  const liveQuestion = drill ? drillQuestion : currentQuestion;
+  const hasLiveContent = Boolean(stream.sql || stream.rows || stream.text);
+  const activeDrillStep = drill ? drill.steps[drill.activeIndex] : null;
 
   return (
     <div className="p-6 space-y-6 max-w-7xl mx-auto">
@@ -297,7 +419,7 @@ export default function QueryPage() {
             size="sm"
             className="gap-2"
             onClick={handleNewChat}
-            disabled={chat.isStreaming}
+            disabled={chat.isStreaming || Boolean(drill)}
             data-testid="button-new-chat"
           >
             <Plus className="h-4 w-4" />
@@ -308,7 +430,7 @@ export default function QueryPage() {
             size="sm"
             className="gap-2"
             onClick={handleClearHistory}
-            disabled={!sessionId || chat.isStreaming || clearHistoryMutation.isPending}
+            disabled={!sessionId || chat.isStreaming || clearHistoryMutation.isPending || Boolean(drill)}
             title="Keep this chat, but stop sending earlier messages as context to the model"
             data-testid="button-clear-history"
           >
@@ -323,6 +445,7 @@ export default function QueryPage() {
             <Database className="h-4 w-4 text-muted-foreground" />
             <Select
               value={selectedConnectionId?.toString() || ""}
+              disabled={Boolean(drill)}
               onValueChange={(value) => setSelectedConnectionId(value ? parseInt(value) : null)}
             >
               <SelectTrigger className="w-[200px]" data-testid="select-connection">
@@ -356,13 +479,61 @@ export default function QueryPage() {
         </div>
       </div>
 
+      {drill && (
+        <Card className="border-primary/30 bg-primary/5">
+          <CardContent className="py-3 px-4">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-1.5 flex-wrap min-w-0">
+                <Filter className="h-4 w-4 text-primary shrink-0" />
+                <span className="text-xs font-medium text-primary shrink-0">Segment Drill-Down:</span>
+                {drill.steps.map((step, index) => (
+                  <div key={step.id} className="flex items-center gap-1.5 min-w-0">
+                    {index > 0 && <ChevronRight className="h-3 w-3 text-muted-foreground shrink-0" />}
+                    <button
+                      onClick={() => handleDrillNavigate(index)}
+                      disabled={drillChat.isStreaming}
+                      className={`text-xs truncate max-w-[220px] transition-colors ${
+                        index === drill.activeIndex
+                          ? "font-medium text-foreground"
+                          : "text-muted-foreground hover:text-foreground"
+                      }`}
+                      title={step.question}
+                      data-testid={`breadcrumb-step-${index}`}
+                    >
+                      {step.question}
+                      {step.rows ? ` (${formatRowCount(step.rows)})` : ""}
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="gap-1.5 shrink-0 text-muted-foreground hover:text-foreground"
+                onClick={handleExitDrill}
+                data-testid="button-exit-drill-down"
+              >
+                <X className="h-3.5 w-3.5" />
+                Exit
+              </Button>
+            </div>
+            {activeDrillStep && !canDrill(activeDrillStep) && (
+              <p className="text-xs text-muted-foreground mt-2">
+                This step isn't a customer list, so it can't be narrowed further. Pick an earlier step or exit.
+              </p>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
       <QueryInput
         onSubmit={handleAsk}
-        isLoading={chat.isStreaming || isLoadingMessages}
-        recentQueries={recentQueries}
+        isLoading={drill ? drillChat.isStreaming : chat.isStreaming || isLoadingMessages}
+        recentQueries={drill ? [] : recentQueries}
+        placeholder={drill ? "Filter this segment further..." : undefined}
       />
 
-      {isLoadingMessages && (
+      {!drill && isLoadingMessages && (
         <Card>
           <CardContent className="pt-6 space-y-3">
             <Skeleton className="h-4 w-1/2" />
@@ -371,7 +542,7 @@ export default function QueryPage() {
         </Card>
       )}
 
-      {chat.isStreaming && !hasLiveContent && (
+      {stream.isStreaming && !hasLiveContent && (
         <Card>
           <CardHeader>
             <div className="flex items-center gap-3">
@@ -380,7 +551,7 @@ export default function QueryPage() {
               </div>
               <div className="space-y-2 flex-1">
                 <p className="text-sm font-medium text-muted-foreground">
-                  {chat.status || "Thinking…"}
+                  {stream.status || "Thinking…"}
                 </p>
                 <Skeleton className="h-3 w-32" />
               </div>
@@ -398,10 +569,10 @@ export default function QueryPage() {
 
       {hasLiveContent && (
         <div className="space-y-3">
-          {chat.status && chat.isStreaming && (
+          {stream.status && stream.isStreaming && (
             <div className="flex items-center gap-2 text-xs text-muted-foreground px-1">
               <Loader2 className="h-3 w-3 animate-spin" />
-              {chat.status}
+              {stream.status}
             </div>
           )}
           <QueryResult
@@ -410,18 +581,18 @@ export default function QueryPage() {
             // once `rows` (and therefore the real chart type) becomes available, since
             // `sql` always arrives before `rows` and we don't want to get stuck on the
             // "table" fallback used before we know the chart type.
-            key={chat.rows ? "live-with-rows" : "live-pending"}
-            query={currentQuestion}
-            summary={chat.text || "…"}
-            data={chat.rows?.data ?? []}
-            sql={chat.sql ?? undefined}
-            visualizationType={mapChartType(chat.rows)}
-            isStreaming={chat.isStreaming}
+            key={stream.rows ? "live-with-rows" : "live-pending"}
+            query={liveQuestion}
+            summary={stream.text || "…"}
+            data={stream.rows?.data ?? []}
+            sql={stream.sql ?? undefined}
+            visualizationType={mapChartType(stream.rows)}
+            isStreaming={stream.isStreaming}
           />
         </div>
       )}
 
-      {chat.error && (
+      {stream.error && (
         <Card className="border-destructive/50 bg-destructive/5">
           <CardContent className="pt-5 pb-5">
             <div className="flex items-start gap-3">
@@ -433,18 +604,18 @@ export default function QueryPage() {
                   Something went wrong
                 </p>
                 <p className="text-sm text-muted-foreground mt-0.5" data-testid="error-detail">
-                  {chat.error}
+                  {stream.error}
                 </p>
               </div>
               <Button
                 variant="outline"
                 size="sm"
                 className="shrink-0 gap-1.5"
-                onClick={() => handleAsk(currentQuestion)}
-                disabled={chat.isStreaming || !currentQuestion}
+                onClick={() => handleAsk(liveQuestion)}
+                disabled={stream.isStreaming || !liveQuestion}
                 data-testid="button-retry-query"
               >
-                {chat.isStreaming ? (
+                {stream.isStreaming ? (
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
                 ) : (
                   <RefreshCw className="h-3.5 w-3.5" />
@@ -456,7 +627,19 @@ export default function QueryPage() {
         </Card>
       )}
 
-      {orderedTurns.map((turn) => (
+      {drill && activeDrillStep && !stream.isStreaming && !hasLiveContent && (
+        <QueryResult
+          key={activeDrillStep.id}
+          query={activeDrillStep.question}
+          summary={activeDrillStep.summary}
+          data={activeDrillStep.rows?.data ?? []}
+          sql={activeDrillStep.sql ?? undefined}
+          visualizationType={mapChartType(activeDrillStep.rows)}
+          clientId={selectedClientId}
+        />
+      )}
+
+      {!drill && orderedTurns.map((turn) => (
         <div key={turn.id}>
           {turn.historyClearedBefore && (
             <div className="flex items-center gap-3 py-1 text-xs text-muted-foreground">
@@ -475,10 +658,12 @@ export default function QueryPage() {
             sql={turn.sql ?? undefined}
             visualizationType={mapChartType(turn.rows)}
             clientId={selectedClientId}
+            onDrillDown={canDrill(turn) && !chat.isStreaming ? () => handleDrillDown(turn) : undefined}
           />
         </div>
       ))}
 
+      {!drill && (
       <Collapsible open={sessionsOpen} onOpenChange={setSessionsOpen}>
         <Card>
           <CollapsibleTrigger asChild>
@@ -554,6 +739,7 @@ export default function QueryPage() {
           </CollapsibleContent>
         </Card>
       </Collapsible>
+      )}
     </div>
   );
 }

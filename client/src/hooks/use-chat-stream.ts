@@ -33,6 +33,7 @@ export interface SendChatOptions {
   sessionId?: string | null;
   clientId?: number | null;
   connectionId?: number | null;
+  extraBody?: Record<string, unknown>;
 }
 
 // Raw (snake_case) event shapes exactly as emitted by the SSE endpoint.
@@ -52,7 +53,7 @@ type RawSseEvent =
   | RawRowsEvent
   | { type: "text"; content: string }
   | { type: "error"; content: string }
-  | { type: "done"; confidence: number; tables_used: string[]; session_id: string };
+  | { type: "done"; confidence: number; tables_used: string[]; session_id: string; sql_token?: string | null };
 
 function normalizeChart(raw: Record<string, unknown>): ChatChartConfig {
   const { x_field, y_field, x_label, y_label, ...rest } = raw as Record<string, unknown>;
@@ -108,6 +109,8 @@ export interface UseChatStreamResult {
   done: boolean;
   confidence: number | null;
   tablesUsed: string[];
+  // Server-signed token for the executed SQL — required to drill into this result.
+  sqlToken: string | null;
 }
 
 /**
@@ -116,8 +119,9 @@ export interface UseChatStreamResult {
  * ourselves). One `send()` call drives one streaming turn; state resets at the start of
  * each new send() and accumulates (sql/text/rows) as events arrive.
  */
-export function useChatStream(): UseChatStreamResult {
+export function useChatStream(endpoint: string = "/api/chat/stream"): UseChatStreamResult {
   const [status, setStatus] = useState<string | null>(null);
+  const [sqlToken, setSqlToken] = useState<string | null>(null);
   const [sql, setSql] = useState<string | null>(null);
   const [rows, setRows] = useState<ChatRowsPayload | null>(null);
   const [text, setText] = useState("");
@@ -143,6 +147,7 @@ export function useChatStream(): UseChatStreamResult {
     setDone(false);
     setConfidence(null);
     setTablesUsed([]);
+    setSqlToken(null);
   }, []);
 
   const stop = useCallback(() => {
@@ -164,11 +169,12 @@ export function useChatStream(): UseChatStreamResult {
     setDone(false);
     setConfidence(null);
     setTablesUsed([]);
+    setSqlToken(null);
     setIsStreaming(true);
 
     (async () => {
       try {
-        const res = await fetch("/api/chat/stream", {
+        const res = await fetch(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           credentials: "include",
@@ -177,6 +183,7 @@ export function useChatStream(): UseChatStreamResult {
             message,
             clientId: options.clientId ?? undefined,
             connectionId: options.connectionId ?? undefined,
+            ...options.extraBody,
           }),
           signal: controller.signal,
         });
@@ -242,6 +249,7 @@ export function useChatStream(): UseChatStreamResult {
                 setConfidence(event.confidence);
                 setTablesUsed(event.tables_used ?? []);
                 setSessionId(event.session_id);
+                setSqlToken(event.sql_token ?? null);
                 setStatus(null);
                 setDone(true);
                 break;
@@ -257,7 +265,7 @@ export function useChatStream(): UseChatStreamResult {
         abortRef.current = null;
       }
     })();
-  }, []);
+  }, [endpoint]);
 
   return {
     send,
@@ -273,5 +281,6 @@ export function useChatStream(): UseChatStreamResult {
     done,
     confidence,
     tablesUsed,
+    sqlToken,
   };
 }

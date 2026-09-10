@@ -30,7 +30,7 @@ import re
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 
-from app.modules.chat_bot import data_availability, guardrails, prompts
+from app.modules.chat_bot import data_availability, drill_down, guardrails, prompts
 from app.modules.chat_bot.config import (
     CHATBOT_ANSWER_ROWS_SAMPLE,
     CHATBOT_LIST_BREAKDOWN_MAX_COLUMNS,
@@ -80,6 +80,11 @@ def _is_sql_tool(name: str) -> bool:
 
 def _extract_sql_from_arguments(arguments: dict) -> str:
     return arguments.get("query") or arguments.get("sql") or ""
+
+
+def _set_sql_argument(arguments: dict, sql: str) -> None:
+    key = "sql" if arguments.get("sql") and not arguments.get("query") else "query"
+    arguments[key] = sql
 
 
 _TABLE_REF_RE = re.compile(r"`?([a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)`?")
@@ -285,12 +290,16 @@ def _build_initial_messages(
     message: str,
     min_session_date: str | None,
     min_customer_created_date: str | None,
+    drill: drill_down.DrillContext | None = None,
 ) -> list[dict]:
     messages: list[dict] = [
         {
             "role": "system",
             "content": prompts.build_sql_generation_system_prompt(
-                message, min_session_date, min_customer_created_date
+                message,
+                min_session_date,
+                min_customer_created_date,
+                drill_block=drill_down.build_prompt_block(drill) if drill is not None else "",
             ),
         }
     ]
@@ -318,6 +327,7 @@ async def stream_single_query(
     api_key: str,
     message: str,
     conversation_history: list[dict] | None,
+    drill: drill_down.DrillContext | None = None,
 ) -> AsyncGenerator[dict, None]:
     # --- MCP client construction --------------------------------------------------------
     try:
@@ -347,7 +357,9 @@ async def stream_single_query(
         # data_availability.py's module docstring for why this is safe to compute once and cache
         # rather than refresh periodically.
         min_session_date, min_customer_created_date = await data_availability.get_min_dates(db, connection)
-        messages = _build_initial_messages(conversation_history, message, min_session_date, min_customer_created_date)
+        messages = _build_initial_messages(
+            conversation_history, message, min_session_date, min_customer_created_date, drill
+        )
         tables_used: list[str] = []
         # Set the moment a SQL tool call comes back with real rows — once this is populated
         # the round loop below breaks out and hands off to a SEPARATE answer-generation call
@@ -405,6 +417,14 @@ async def stream_single_query(
                 bad_join_reason: str | None = None
                 if _is_sql_tool(name):
                     sql = _extract_sql_from_arguments(arguments)
+                    if drill is not None:
+                        if drill_down.references_previous_segment(sql):
+                            # Compose BEFORE the guardrails below so they check (and the UI shows)
+                            # the full query that actually runs, not the model's fragment.
+                            sql = drill_down.compose_drill_sql(sql, drill.base_sql)
+                            _set_sql_argument(arguments, sql)
+                        else:
+                            bad_join_reason = drill_down.MISSING_SEGMENT_REASON
                     is_safe, unsafe_reason = guardrails.check_sql_safety(sql)
                     if not is_safe:
                         yield {
@@ -416,7 +436,7 @@ async def stream_single_query(
                     # Unlike check_sql_safety above, a bad join is retryable — feed it back to
                     # the model as a tool-error-style message (below) instead of aborting the
                     # whole turn, so it gets a chance to fix the join and try again.
-                    bad_join_reason = guardrails.check_join_conditions(sql)
+                    bad_join_reason = bad_join_reason or guardrails.check_join_conditions(sql)
                     for table in _extract_tables_used(sql):
                         if table not in tables_used:
                             tables_used.append(table)
@@ -593,6 +613,8 @@ async def stream_single_query(
                 "report a count from this data (e.g. \"at least N\", not a bare total) — do not "
                 "state the capped number as if it were the complete total."
             )
+        if drill is not None:
+            query_result_block += drill_down.build_answer_note(drill)
         answer_messages = [
             {"role": "system", "content": prompts.build_answer_generation_system_prompt(message, query_result_block)},
             {"role": "user", "content": message},

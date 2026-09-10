@@ -18,7 +18,7 @@ from app.core.serialize import to_camel, to_camel_list
 from app.db import SessionLocal, get_db
 from app.dependencies import can_access_client, get_user_id, require_authenticated_or_token
 from app.models.chatbot import ChatbotToken, ChatSession
-from app.modules.chat_bot import repo, service
+from app.modules.chat_bot import drill_down, repo, service
 from app.modules.chat_bot.llm_client import discover_models
 
 router = APIRouter(tags=["chat-bot"], dependencies=[Depends(require_authenticated_or_token)])
@@ -56,11 +56,60 @@ async def chat_stream(body: ChatStreamBody, request: Request, db: AsyncSession =
     return StreamingResponse(
         _sse_body(user_id, body.sessionId, body.clientId, body.connectionId, body.message),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
+        headers=_SSE_HEADERS,
+    )
+
+
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",
+    "Connection": "keep-alive",
+}
+
+
+class DrillStepBody(BaseModel):
+    question: str
+    rowCount: int | None = None
+
+
+class DrillStreamBody(BaseModel):
+    sessionId: str
+    message: str
+    baseSql: str
+    baseToken: str
+    baseColumns: list[str] = []
+    chain: list[DrillStepBody] = []
+
+
+async def _drill_sse_body(user_id: str, body: DrillStreamBody):
+    # Fresh DB session for the same reason as _sse_body above.
+    async with SessionLocal() as db:
+        async for event in service.stream_drill_step(
+            db,
+            user_id,
+            body.sessionId,
+            body.message,
+            body.baseSql,
+            body.baseToken,
+            body.baseColumns,
+            [{"question": step.question, "row_count": step.rowCount} for step in body.chain],
+        ):
+            yield f"data: {json.dumps(event)}\n\n"
+
+
+@router.post("/api/chat/drill/stream")
+async def chat_drill_stream(body: DrillStreamBody, request: Request, db: AsyncSession = Depends(get_db)):
+    user_id = get_user_id(request)
+    session = await repo.get_session(db, body.sessionId)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if not await _can_access_session(request, db, session, user_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    return StreamingResponse(
+        _drill_sse_body(user_id, body),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
     )
 
 
@@ -93,7 +142,12 @@ async def list_session_messages(session_id: str, request: Request, db: AsyncSess
     if not await _can_access_session(request, db, session, user_id):
         raise HTTPException(status_code=403, detail="Access denied")
     messages = await repo.get_messages(db, session_id)
-    return to_camel_list(messages)
+    payload = to_camel_list(messages)
+    for item, message in zip(payload, messages):
+        # Lets a turn reopened from history be drilled into, same as a freshly streamed one.
+        if message.role == "assistant" and message.sql and message.rows and session.connection_id is not None:
+            item["sqlToken"] = drill_down.sign_sql(user_id, session.connection_id, message.sql)
+    return payload
 
 
 class RenameSessionBody(BaseModel):

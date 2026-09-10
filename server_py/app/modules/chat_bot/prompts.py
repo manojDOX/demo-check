@@ -421,7 +421,7 @@ call the SQL-execution tool with that query.
 <USER_PROMPT>
 {user_prompt}
 </USER_PROMPT>
-
+{drill_block}
 <TABLE_GUIDE>
 {table_guide}
 </TABLE_GUIDE>
@@ -496,6 +496,10 @@ call the SQL-execution tool with that query.
   presented to the user as if it were complete, which is worse than a large result. Only add a
   `LIMIT` when the user explicitly asked for a specific number ("top 10 customers by MRR", "the
   5 most recent sessions").
+- CUSTOMER LISTS INCLUDE client_id: whenever the result is a list of individual customers (one row
+  per customer), always include client_id in the SELECT alongside the name/contact columns — the
+  application uses it to let the user narrow that list further. Don't add it to aggregate/count
+  results.
 - Prefer the read-only SQL-execution tool; do not attempt to write or modify data unless the
   user explicitly asks for it.
 - ROW-COUNTING GOTCHAS (verified against live data, not assumed): subscription_360_vw has exact
@@ -533,6 +537,7 @@ def build_sql_generation_system_prompt(
     user_message: str,
     min_session_date: str | None = None,
     min_customer_created_date: str | None = None,
+    drill_block: str = "",
 ) -> str:
     """Rebuilds the system prompt fresh for the current turn, embedding the live question in
     <USER_PROMPT> at the top of the prompt, above <TABLE_GUIDE> and <SQL_SCHEMA> — the
@@ -544,6 +549,7 @@ def build_sql_generation_system_prompt(
     AutoCare-sourced column descriptions in <SQL_SCHEMA> — see _build_sql_schema_block."""
     return _SQL_GENERATION_TEMPLATE.format(
         user_prompt=user_message,
+        drill_block=drill_block,
         table_guide=_TABLE_GUIDE,
         schema=_build_sql_schema_block(min_session_date, min_customer_created_date),
     )

@@ -13,7 +13,7 @@ from collections.abc import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.chatbot import ChatSession
-from app.modules.chat_bot import guardrails, repo, sql_agent
+from app.modules.chat_bot import drill_down, guardrails, repo, sql_agent
 from app.modules.connections import repo as connections_repo
 from app.modules.kpi import repo as kpi_repo
 from app.modules.team import repo as team_repo
@@ -142,6 +142,13 @@ def _should_bill(billable: bool | None, confidence: float) -> bool:
     return confidence > 0.2
 
 
+def _result_sql_token(user_id: str, connection_id: int | None, sql: str | None, rows_payload: dict | None) -> str | None:
+    # Only SQL that actually ran and returned rows can be drilled into.
+    if not sql or rows_payload is None or connection_id is None:
+        return None
+    return drill_down.sign_sql(user_id, connection_id, sql)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -247,4 +254,108 @@ async def stream_chat(
         "confidence": final_confidence,
         "tables_used": final_tables_used,
         "session_id": session.id,
+        "sql_token": _result_sql_token(user_id, session.connection_id, final_sql, final_rows_payload),
+    }
+
+
+def _error_events(content: str, session_id: str | None) -> list[dict]:
+    return [
+        {"type": "error", "content": content},
+        {"type": "done", "confidence": 0.0, "tables_used": [], "session_id": session_id, "sql_token": None},
+    ]
+
+
+async def stream_drill_step(
+    db: AsyncSession,
+    user_id: str,
+    session_id: str,
+    message: str,
+    base_sql: str,
+    base_token: str,
+    base_columns: list[str],
+    chain: list[dict],
+) -> AsyncGenerator[dict, None]:
+    """One segment drill-down step: answers `message` only within the result of `base_sql` (a
+    previous step's signed SQL). Unlike stream_chat, nothing is persisted and no chat history is
+    used — drill steps live only in the browser (see drill_down.py)."""
+    is_safe, block_reason = guardrails.check_input_safety(message)
+    if not is_safe:
+        for event in _error_events(block_reason or "This message can't be processed.", session_id):
+            yield event
+        return
+
+    session = await repo.get_session(db, session_id)
+    if session is None or session.connection_id is None:
+        for event in _error_events("This chat session is no longer available.", session_id):
+            yield event
+        return
+
+    if not drill_down.verify_sql(user_id, session.connection_id, base_sql, base_token):
+        for event in _error_events(
+            "This segment can't be narrowed any more — run the original question again, then drill down.",
+            session.id,
+        ):
+            yield event
+        return
+
+    connection = await connections_repo.get_connection(db, session.connection_id)
+    if connection is None:
+        for event in _error_events("No BigQuery connection is configured for this client yet.", session.id):
+            yield event
+        return
+
+    token = await get_active_token_for(db, user_id, session.client_id)
+    if token is None:
+        for event in _error_events("Add an LLM API key in chatbot settings before asking a question.", session.id):
+            yield event
+        return
+
+    drill = drill_down.DrillContext(
+        base_sql=base_sql,
+        base_columns=drill_down.sanitize_columns(base_columns),
+        chain=[step for step in drill_down.sanitize_chain(chain) if guardrails.check_input_safety(step.question)[0]],
+    )
+
+    final_sql: str | None = None
+    final_rows_payload: dict | None = None
+    final_confidence = 0.0
+    final_tables_used: list[str] = []
+    billable: bool | None = None
+
+    async for event in sql_agent.stream_single_query(
+        db=db,
+        user_id=user_id,
+        connection=connection,
+        client_id=session.client_id,
+        provider=token.provider,
+        model=token.model,
+        api_key=token.llm_api_token,
+        message=message,
+        conversation_history=[],
+        drill=drill,
+    ):
+        event_type = event.get("type")
+        if event_type == "done":
+            final_confidence = event.get("confidence", final_confidence)
+            if event.get("tables_used"):
+                final_tables_used = event["tables_used"]
+            billable = event.get("billable")
+            continue
+        if event_type == "sql":
+            final_sql = event.get("content")
+            if event.get("tables_used"):
+                final_tables_used = event["tables_used"]
+        elif event_type == "rows":
+            final_rows_payload = {k: v for k, v in event.items() if k != "type"}
+        yield event
+
+    if _should_bill(billable, final_confidence):
+        await repo.increment_usage(db, user_id)
+
+    yield {
+        "type": "done",
+        "confidence": final_confidence,
+        "tables_used": final_tables_used,
+        "session_id": session.id,
+        "sql_token": _result_sql_token(user_id, session.connection_id, final_sql, final_rows_payload),
     }
