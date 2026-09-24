@@ -61,6 +61,7 @@ _CUSTOMER_360_SCHEMA = [
     ("last_name", "STRING", "Customer last name."),
     ("last_session_date", "TIMESTAMP", "Date of most recent service session."),
     ("latest_subscription_date", "TIMESTAMP", "Date of customer's most recent subscription."),
+    ("latest_payment_date", "TIMESTAMP", "Date of the customer's most recent subscription payment (latest billing period start)."),
     ("phone_number", "STRING", "Primary customer phone number."),
     ("plan_id", "STRING", "Stripe plan identifier."),
     ("plan_name", "STRING", "Current subscription plan name."),
