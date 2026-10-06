@@ -412,7 +412,22 @@ _TABLE_GUIDE = """- Question about a CUSTOMER as a person/account (who are they,
   then count session_360_vw rows per customer where session_date < COALESCE(canceled_at, ended_at)
   from that customer's cancelled subscription — i.e. only sessions that happened before the
   cancellation, not their full session history. This is answerable with the available columns and
-  the client_id join key, not out of scope."""
+  the client_id join key, not out of scope.
+- Question about ONE specific customer's membership, subscription or renewal (e.g. "when does
+  jane@x.com renew?", "is John Smith still a member?", "what plan is this email on?") -> look the
+  customer up in customer_360_vw FIRST, never in subscription_360_vw alone. customer_360_vw has
+  exactly one row per customer, including customers who never subscribed; subscription_360_vw has no
+  row at all for them, so an empty result there cannot tell "never subscribed" apart from "not a
+  customer". Find the customer by email (LOWER(email) = LOWER('...')), by phone_number, or by name
+  (LIKE, per STRING EQUALITY), and return customer_status, customer_created_date,
+  has_active_subscription, current_subscription_status, tier_name, subscription_interval,
+  latest_subscription_date and current_period_end (the renewal date). customer_status says which case
+  applies: 'Prospect' = signed up but never subscribed, so no renewal date exists; 'Inactive Member'
+  = had a subscription that is no longer active; 'Active Member' = has a current subscription. Apply
+  SUBSCRIPTION STATUS IS STALE before calling a renewal date current. No row at all means the person
+  is not a customer in this data. Use subscription_360_vw only when the question is about a specific
+  subscription or about several of one customer's subscriptions. This is answerable, not out of
+  scope."""
 
 _SQL_GENERATION_TEMPLATE = """You're an expert at SQL, working inside a BigQuery tool-calling agent. You will be
 given a business user's natural-language question about their own customer data, and a set of
@@ -623,6 +638,14 @@ for a decision, not a database echoing rows back.
 - If the question was really a request for advice or recommendations rather than data, answer from general
   marketing/customer-success best practice grounded in whatever data is available — not every recommendation needs
   to cite a specific number.
+- ONE-CUSTOMER MEMBERSHIP QUESTIONS (renewal date, plan, "is he a member?"): always say which situation applies,
+  never just "no active subscription record". A customer who signed up but never subscribed (a prospect): say they
+  signed up on that date and have never subscribed, so there is no renewal date — e.g. "Agustin Negron signed up on
+  28 Sep 2026 and has never subscribed, so there is no renewal date." A former member: say the membership is not
+  active and say why when the status shows it (cancelled, expired, or the payment never completed); name a date only
+  when it is in the past, and never call a future period end date a renewal date for a membership that is not
+  active. A current member: give the plan and the renewal date. No matching row: say no customer with those details
+  was found in the data.
 </RULES>"""
 
 
