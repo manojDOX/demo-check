@@ -131,6 +131,39 @@ def _is_list_shaped_sql(sql: str) -> bool:
     return not _AGGREGATE_SHAPE_RE.search(sql or "")
 
 
+# Added by the application, not the model, so the wording is identical on every run.
+CUSTOMER_LEVEL_ACTIVE_NOTE = (
+    "Note: this figure is at the customer level. It counts each customer with at least one active "
+    "subscription once, even when a customer holds several active memberships, so it can be lower than "
+    "the total number of active memberships."
+)
+
+_FALSE_FILTER_RE = re.compile(
+    r"NOT\s+(?:COALESCE\s*\(\s*)?has_active_subscription\b"
+    r"|has_active_subscription\b\s*(?:=\s*(?:FALSE|0)\b|IS\s+FALSE\b|!=\s*TRUE\b|<>\s*TRUE\b)",
+    re.IGNORECASE,
+)
+_ONE_CUSTOMER_FILTER_RE = re.compile(
+    r"\b(?:email|phone_number|client_id|stripe_customer_id)\b\s*\)?\s*=", re.IGNORECASE
+)
+
+
+def _is_customer_level_active_query(sql: str) -> bool:
+    """True for a customer_360_vw query that FILTERS on has_active_subscription being true — a count
+    or list of customers with an active subscription. A lookup of one customer (filtered by
+    email/phone/id) and a query that only selects the column don't qualify."""
+    if not sql or not re.search(r"\bcustomer_360_vw\b", sql, re.IGNORECASE):
+        return False
+    where = re.search(r"\bWHERE\b", sql, re.IGNORECASE)
+    if where is None:
+        return False
+    condition = sql[where.end():]
+    if _ONE_CUSTOMER_FILTER_RE.search(condition):
+        return False
+    condition = _FALSE_FILTER_RE.sub(" ", condition)
+    return re.search(r"\bhas_active_subscription\b", condition, re.IGNORECASE) is not None
+
+
 def _build_list_aggregate_summary(sql: str, columns: list[str], data: list[dict], total_rows: int) -> str:
     """Builds a compact <QUERY_RESULT> text block for a large list-shaped result: a total-count
     line (plus an honesty caveat when `data` is itself only a slice of `total_rows`, whether from
@@ -706,6 +739,13 @@ async def stream_single_query(
                 f"\n\nUnique customers (distinct client_id) in this result: {unique_customers:,} "
                 f"across {total_rows:,} rows."
             )
+        customer_level_active = _is_customer_level_active_query(successful_result["sql"])
+        if customer_level_active:
+            query_result_block += (
+                "\n\nThe application adds a fixed note after your answer explaining that this figure counts "
+                "customers, not memberships. Do not write that note yourself and do not compare it with a "
+                "membership total."
+            )
         if drill is not None:
             query_result_block += drill_down.build_answer_note(drill)
         answer_messages = [
@@ -737,6 +777,8 @@ async def stream_single_query(
         elif content and date_range and full_data_complete:
             _, min_value, max_value = date_range
             content += f"\n\nThis response is based on data from {min_value} to {max_value}."
+        if content and customer_level_active:
+            content += "\n\n" + CUSTOMER_LEVEL_ACTIVE_NOTE
         shown_rows = len(successful_result["data"])
         if content and total_rows > shown_rows:
             content += "\n\n" + result_summary.build_partial_list_note(
