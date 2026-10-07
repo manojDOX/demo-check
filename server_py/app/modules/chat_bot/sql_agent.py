@@ -429,7 +429,7 @@ async def stream_single_query(
                 # The visible output is just a SQL tool-call argument, but reasoning models spend
                 # part of this budget thinking first — see CHATBOT_SQL_MAX_TOKENS in config.py.
                 response = await call_llm_with_tools(
-                    provider, model, api_key, messages, openai_format_tools, max_tokens=sql_max_tokens, temperature=0.2
+                    provider, model, api_key, messages, openai_format_tools, max_tokens=sql_max_tokens, temperature=0
                 )
             except Exception as error:
                 yield {"type": "error", "content": f"Couldn't get a response from the model: {error}"}

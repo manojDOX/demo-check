@@ -387,8 +387,8 @@ _TABLE_GUIDE = """- Question about a CUSTOMER as a person/account (who are they,
 - Question combining PAYING (subscribed/billed) with NOT VISITING over some duration (e.g.
   "customers paying for N months without visiting", "paying members who haven't come in") ->
   answerable from customer_360_vw alone, no join needed. "Paying" = currently has an active
-  subscription that's been running at least that long: has_active_subscription = TRUE AND
-  current_period_end >= CURRENT_TIMESTAMP() (per the SUBSCRIPTION STATUS IS STALE rule) AND
+  subscription that's been running at least that long: has_active_subscription = TRUE (alone, per
+  the ACTIVE MEMBERSHIPS HAVE ONE FIXED DEFINITION rule — no current_period_end condition) AND
   subscription_tenure_days >= N * 30. "Without visiting" (for that same span) = either
   last_session_date IS NULL (never visited at all) or last_session_date < a cutoff N * 30 days
   before now (per NULL-SAFE FILTERING, remember to include the IS NULL case explicitly). There is
@@ -423,11 +423,22 @@ _TABLE_GUIDE = """- Question about a CUSTOMER as a person/account (who are they,
   has_active_subscription, current_subscription_status, tier_name, subscription_interval,
   latest_subscription_date and current_period_end (the renewal date). customer_status says which case
   applies: 'Prospect' = signed up but never subscribed, so no renewal date exists; 'Inactive Member'
-  = had a subscription that is no longer active; 'Active Member' = has a current subscription. Apply
-  SUBSCRIPTION STATUS IS STALE before calling a renewal date current. No row at all means the person
+  = had a subscription that is no longer active; 'Active Member' = has a current subscription. Give
+  current_period_end as the renewal date only for an Active Member. No row at all means the person
   is not a customer in this data. Use subscription_360_vw only when the question is about a specific
   subscription or about several of one customer's subscriptions. This is answerable, not out of
-  scope."""
+  scope.
+- Question asking HOW MANY, or for a LIST of, active memberships / active members / active customers
+  (e.g. "active memberships", "how many active memberships?", "how many members do we have?") ->
+  ALWAYS this exact query shape, never a variation:
+  SELECT COUNT(*) AS active_memberships FROM `marketing_analytics_ss.customer_360_vw` WHERE
+  has_active_subscription = TRUE
+  customer_360_vw has one row per customer, so COUNT(*) counts customers. Do not add a
+  current_period_end condition (see ACTIVE MEMBERSHIPS HAVE ONE FIXED DEFINITION). For a list, select
+  client_id, full_name, email, phone_number from the same table with the same WHERE; for a split by
+  plan, add tier_name and GROUP BY tier_name. Count SUBSCRIPTIONS instead of customers only when the
+  user says "subscriptions": subscription_360_vw, COUNT(DISTINCT subscription_id) WHERE
+  is_active_subscription = TRUE."""
 
 _SQL_GENERATION_TEMPLATE = """You're an expert at SQL, working inside a BigQuery tool-calling agent. You will be
 given a business user's natural-language question about their own customer data, and a set of
@@ -537,15 +548,15 @@ call the SQL-execution tool with that query.
   can only do that if that column is part of what's returned.
 - refund_required (subscription_360_vw) is a STRING holding the literal text 'true'/'false', not
   a BOOL — filter with `refund_required = 'true'`, not a boolean comparison.
-- SUBSCRIPTION STATUS IS STALE, NOT LIVE (verified against live data): `subscription_status =
-  'active'` and `is_active_subscription = TRUE` (the latter is just a direct copy of the former,
-  not an independent check) do NOT reliably mean the subscription is currently in a paid period —
-  37% of rows marked 'active' already have `current_period_end` in the past /
-  `days_until_renewal` negative, meaning the status field isn't kept in sync once a period lapses.
-  A smaller number of 'canceled' rows show the opposite: a `current_period_end` still in the
-  future. For any "currently active" / "paying right now" question, do NOT rely on
-  subscription_status alone — check `current_period_end >= CURRENT_TIMESTAMP()` (or
-  `days_until_renewal >= 0`) too, and say plainly which definition you used if the two disagree.
+- ACTIVE MEMBERSHIPS HAVE ONE FIXED DEFINITION: a customer has an active membership when
+  `has_active_subscription = TRUE` (customer_360_vw); a subscription is active when
+  `is_active_subscription = TRUE` (subscription_360_vw). Use that flag ALONE for every "active
+  memberships" / "active members" / "active customers" / "currently active" / "paying" question.
+  NEVER add `current_period_end`, `days_until_renewal`, `subscription_status` or any other date or
+  status condition to it. The data loads once a day, so a period-end check changes the number with
+  the time of day, and the same question must always return the same number. `current_period_end`
+  is a renewal date: use it only when the question is about renewals. Writing two different SQL
+  statements for the same question is a bug.
 </RULES>
 
 Do NOT prefix any table name with a project id in your SQL — the correct GCP project is already
