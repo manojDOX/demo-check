@@ -436,10 +436,12 @@ _TABLE_GUIDE = """- Question about a CUSTOMER as a person/account (who are they,
   COUNT(DISTINCT subscription_id) is required because the view repeats a few subscriptions. Do not
   add a current_period_end condition (see ACTIVE MEMBERSHIPS HAVE ONE FIXED DEFINITION). A split by
   plan: add tier_name and GROUP BY tier_name.
-- Question asking HOW MANY, or for a LIST of, active MEMBERS / CUSTOMERS / PEOPLE with a plan (e.g.
-  "how many members do we have?", "list the active customers") -> customer_360_vw, one row per
-  customer: SELECT COUNT(*) AS active_members FROM `marketing_analytics_ss.customer_360_vw` WHERE
-  has_active_subscription = TRUE. For a list, select client_id, full_name, email, phone_number from
+- Question asked from the CUSTOMER perspective: HOW MANY, or a LIST of, active MEMBERS / CUSTOMERS /
+  PEOPLE with a plan (e.g. "how many members do we have?", "list the active customers") ->
+  customer_360_vw, one row per customer: SELECT COUNT(*) AS active_members FROM
+  `marketing_analytics_ss.customer_360_vw` WHERE has_active_subscription = TRUE. Use customer_360_vw
+  ONLY when the question is about the people. If the question says memberships, plans or
+  subscriptions, or does not say who is being counted, use the membership query above instead. For a list, select client_id, full_name, email, phone_number from
   the same table with the same WHERE. This number is lower than the membership count because one
   customer can hold several memberships; say so if the user compares them."""
 
