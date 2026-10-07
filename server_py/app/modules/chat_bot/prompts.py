@@ -428,17 +428,20 @@ _TABLE_GUIDE = """- Question about a CUSTOMER as a person/account (who are they,
   is not a customer in this data. Use subscription_360_vw only when the question is about a specific
   subscription or about several of one customer's subscriptions. This is answerable, not out of
   scope.
-- Question asking HOW MANY, or for a LIST of, active memberships / active members / active customers
-  (e.g. "active memberships", "how many active memberships?", "how many members do we have?") ->
-  ALWAYS this exact query shape, never a variation:
-  SELECT COUNT(*) AS active_memberships FROM `marketing_analytics_ss.customer_360_vw` WHERE
-  has_active_subscription = TRUE
-  customer_360_vw has one row per customer, so COUNT(*) counts customers. Do not add a
-  current_period_end condition (see ACTIVE MEMBERSHIPS HAVE ONE FIXED DEFINITION). For a list, select
-  client_id, full_name, email, phone_number from the same table with the same WHERE; for a split by
-  plan, add tier_name and GROUP BY tier_name. Count SUBSCRIPTIONS instead of customers only when the
-  user says "subscriptions": subscription_360_vw, COUNT(DISTINCT subscription_id) WHERE
-  is_active_subscription = TRUE."""
+- Question asking HOW MANY active MEMBERSHIPS or active SUBSCRIPTIONS (e.g. "active memberships",
+  "how many active memberships?", "how many active subscriptions?") -> ALWAYS this exact query shape,
+  never a variation:
+  SELECT COUNT(DISTINCT subscription_id) AS active_memberships FROM
+  `marketing_analytics_ss.subscription_360_vw` WHERE is_active_subscription = TRUE
+  COUNT(DISTINCT subscription_id) is required because the view repeats a few subscriptions. Do not
+  add a current_period_end condition (see ACTIVE MEMBERSHIPS HAVE ONE FIXED DEFINITION). A split by
+  plan: add tier_name and GROUP BY tier_name.
+- Question asking HOW MANY, or for a LIST of, active MEMBERS / CUSTOMERS / PEOPLE with a plan (e.g.
+  "how many members do we have?", "list the active customers") -> customer_360_vw, one row per
+  customer: SELECT COUNT(*) AS active_members FROM `marketing_analytics_ss.customer_360_vw` WHERE
+  has_active_subscription = TRUE. For a list, select client_id, full_name, email, phone_number from
+  the same table with the same WHERE. This number is lower than the membership count because one
+  customer can hold several memberships; say so if the user compares them."""
 
 _SQL_GENERATION_TEMPLATE = """You're an expert at SQL, working inside a BigQuery tool-calling agent. You will be
 given a business user's natural-language question about their own customer data, and a set of
@@ -548,10 +551,11 @@ call the SQL-execution tool with that query.
   can only do that if that column is part of what's returned.
 - refund_required (subscription_360_vw) is a STRING holding the literal text 'true'/'false', not
   a BOOL — filter with `refund_required = 'true'`, not a boolean comparison.
-- ACTIVE MEMBERSHIPS HAVE ONE FIXED DEFINITION: a customer has an active membership when
-  `has_active_subscription = TRUE` (customer_360_vw); a subscription is active when
-  `is_active_subscription = TRUE` (subscription_360_vw). Use that flag ALONE for every "active
-  memberships" / "active members" / "active customers" / "currently active" / "paying" question.
+- ACTIVE MEMBERSHIPS HAVE ONE FIXED DEFINITION: a membership is one active subscription (a customer
+  can hold several, for example one per vehicle), and it is active when `is_active_subscription =
+  TRUE` (subscription_360_vw). A customer has an active membership when `has_active_subscription =
+  TRUE` (customer_360_vw). Use that flag ALONE for every "active memberships" / "active
+  subscriptions" / "active members" / "active customers" / "currently active" / "paying" question.
   NEVER add `current_period_end`, `days_until_renewal`, `subscription_status` or any other date or
   status condition to it. The data loads once a day, so a period-end check changes the number with
   the time of day, and the same question must always return the same number. `current_period_end`
