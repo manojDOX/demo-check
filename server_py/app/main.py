@@ -51,6 +51,13 @@ def _run_pending_migrations() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await asyncio.to_thread(_run_pending_migrations)
+    if settings.AUTOCARE_MCP_KEY.strip():
+        print("[startup] AutoCare MCP key: set")
+    else:
+        print(
+            "[startup] AutoCare MCP key: NOT SET (add AUTOCARE_MCP_KEY to the secrets). "
+            "The chat will use the backup SQL engine."
+        )
     yield
 
 

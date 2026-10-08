@@ -54,12 +54,13 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
-import { useState, useRef } from "react";
+import { Fragment, useState, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { Send, AlertTriangle, Filter } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
+import type { ChatExplain, ChatQuerySpec } from "@/hooks/use-chat-stream";
 
 type VisualizationType = "bar" | "line" | "pie" | "table";
 
@@ -83,6 +84,9 @@ interface QueryResultProps {
   totalRows?: number;
   uniqueCustomers?: number | null;
   totalExact?: boolean;
+  // Plain-words calculation lines and the query that made this result ("How it was calculated").
+  explain?: ChatExplain | null;
+  querySpec?: ChatQuerySpec | null;
 }
 
 const CHART_COLORS = [
@@ -131,6 +135,28 @@ function FormattedAnswerText({ text }: { text: string }) {
   );
 }
 
+function TechnicalBlock({ title, text }: { title: string; text: string }) {
+  return (
+    <div>
+      <div className="mb-1 flex items-center justify-between">
+        <span className="font-medium">{title}</span>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-6 gap-1 px-2 text-xs"
+          onClick={() => navigator.clipboard.writeText(text)}
+        >
+          <Copy className="h-3 w-3" />
+          Copy
+        </Button>
+      </div>
+      <pre className="overflow-x-auto rounded-lg bg-muted p-3 font-mono text-xs">
+        <code>{text}</code>
+      </pre>
+    </div>
+  );
+}
+
 export function QueryResult({
   query,
   summary,
@@ -150,6 +176,8 @@ export function QueryResult({
   totalRows,
   uniqueCustomers = null,
   totalExact = true,
+  explain = null,
+  querySpec = null,
 }: QueryResultProps) {
   const [vizType, setVizType] = useState<VisualizationType>(initialType);
   const [isSaved, setIsSaved] = useState(initialSaved);
@@ -1105,7 +1133,7 @@ export function QueryResult({
             </div>
 
             <div className="flex items-center gap-2">
-              {sql && (
+              {(sql || explain) && (
                 <Button
                   variant="outline"
                   size="sm"
@@ -1114,7 +1142,9 @@ export function QueryResult({
                   data-testid="button-show-sql"
                 >
                   <Code className="h-4 w-4" />
-                  {showSql ? "Hide SQL" : "View SQL"}
+                  {explain
+                    ? showSql ? "Hide calculation" : "How it was calculated"
+                    : showSql ? "Hide SQL" : "View SQL"}
                 </Button>
               )}
               <Button 
@@ -1213,7 +1243,32 @@ export function QueryResult({
             </div>
           </div>
 
-          {showSql && sql && (
+          {showSql && explain && (
+            <div className="rounded-lg border bg-muted/40 p-4 space-y-3" data-testid="panel-how-calculated">
+              <h4 className="text-sm font-semibold">How it was calculated</h4>
+              <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1.5 text-sm">
+                {explain.lines.map((line, index) => (
+                  <Fragment key={index}>
+                    <dt className="text-muted-foreground">{line.label}</dt>
+                    <dd>{line.value}</dd>
+                  </Fragment>
+                ))}
+              </dl>
+              {(querySpec || sql) && (
+                <details className="text-xs">
+                  <summary className="cursor-pointer text-sm font-medium">Technical details</summary>
+                  <div className="mt-2 space-y-3">
+                    {querySpec && (
+                      <TechnicalBlock title="Query (JSON)" text={JSON.stringify(querySpec.spec, null, 2)} />
+                    )}
+                    {sql && <TechnicalBlock title="SQL with values inserted" text={sql} />}
+                  </div>
+                </details>
+              )}
+            </div>
+          )}
+
+          {showSql && !explain && sql && (
             <div className="relative">
               <pre className="p-4 bg-muted rounded-lg overflow-x-auto text-xs font-mono">
                 <code>{sql}</code>

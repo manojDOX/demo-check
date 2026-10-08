@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     PUBLIC_OBJECT_SEARCH_PATHS: str = ""
     PRIVATE_OBJECT_DIR: str = ""
 
+    # AutoCare MCP server (chatbot analytics). The key is a secret: set AUTOCARE_MCP_KEY in Replit
+    # Secrets. Without it the chatbot uses the old SQL engine as a fallback.
+    AUTOCARE_MCP_URL: str = "https://autocare-mcp-199378855169.us-central1.run.app/mcp"
+    AUTOCARE_MCP_KEY: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:

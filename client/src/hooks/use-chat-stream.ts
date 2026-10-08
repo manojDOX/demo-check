@@ -18,6 +18,18 @@ export interface ChatChartConfig {
   [key: string]: unknown;
 }
 
+// The AutoCare query that produced a result. The browser sends it back to narrow ("drill into") that result.
+export interface ChatQuerySpec {
+  tool: string;
+  view: string | null;
+  spec: Record<string, unknown>;
+}
+
+// "How it was calculated": plain-words lines built by the server from the query spec.
+export interface ChatExplain {
+  lines: Array<{ label: string; value: string }>;
+}
+
 export interface ChatRowsPayload {
   columns: string[];
   data: Array<Record<string, unknown>>;
@@ -26,6 +38,10 @@ export interface ChatRowsPayload {
   uniqueCustomers: number | null;
   // False only when the query hit the BigQuery row cap and the exact total couldn't be computed.
   totalExact: boolean;
+  // Null for results that cannot be narrowed (backup engine, older chats, customer lookups).
+  spec: ChatQuerySpec | null;
+  // Null for older chats and backup-engine answers: the panel then shows the SQL only.
+  explain: ChatExplain | null;
   viz: {
     showTable: boolean;
     charts: ChatChartConfig[];
@@ -48,6 +64,8 @@ type RawRowsEvent = {
   truncated: boolean;
   unique_customers?: number | null;
   total_exact?: boolean;
+  spec?: ChatQuerySpec | null;
+  explain?: ChatExplain | null;
   viz: { show_table: boolean; charts: Array<Record<string, unknown>> };
 };
 
@@ -59,7 +77,7 @@ type RawSseEvent =
   | { type: "row_count"; total_rows: number; unique_customers: number | null; total_exact: boolean }
   | { type: "text"; content: string }
   | { type: "error"; content: string }
-  | { type: "done"; confidence: number; tables_used: string[]; session_id: string; sql_token?: string | null };
+  | { type: "done"; confidence: number; tables_used: string[]; session_id: string };
 
 // Mirrors CHATBOT_MCP_ROW_CAP in server_py/app/modules/chat_bot/config.py.
 const MCP_ROW_CAP = 3000;
@@ -85,6 +103,8 @@ function normalizeRows(evt: RawRowsEvent): ChatRowsPayload {
     uniqueCustomers: evt.unique_customers ?? null,
     // Messages saved before exact totals existed: a capped result's total is unknown.
     totalExact: evt.total_exact ?? !(evt.truncated && (evt.total_rows ?? 0) >= MCP_ROW_CAP),
+    spec: evt.spec ?? null,
+    explain: evt.explain ?? null,
     viz: {
       showTable: Boolean(evt.viz?.show_table),
       charts: (evt.viz?.charts ?? []).map(normalizeChart),
@@ -121,8 +141,6 @@ export interface UseChatStreamResult {
   done: boolean;
   confidence: number | null;
   tablesUsed: string[];
-  // Server-signed token for the executed SQL — required to drill into this result.
-  sqlToken: string | null;
 }
 
 /**
@@ -133,7 +151,6 @@ export interface UseChatStreamResult {
  */
 export function useChatStream(endpoint: string = "/api/chat/stream"): UseChatStreamResult {
   const [status, setStatus] = useState<string | null>(null);
-  const [sqlToken, setSqlToken] = useState<string | null>(null);
   const [sql, setSql] = useState<string | null>(null);
   const [rows, setRows] = useState<ChatRowsPayload | null>(null);
   const [text, setText] = useState("");
@@ -159,7 +176,6 @@ export function useChatStream(endpoint: string = "/api/chat/stream"): UseChatStr
     setDone(false);
     setConfidence(null);
     setTablesUsed([]);
-    setSqlToken(null);
   }, []);
 
   const stop = useCallback(() => {
@@ -181,7 +197,6 @@ export function useChatStream(endpoint: string = "/api/chat/stream"): UseChatStr
     setDone(false);
     setConfidence(null);
     setTablesUsed([]);
-    setSqlToken(null);
     setIsStreaming(true);
 
     (async () => {
@@ -276,7 +291,6 @@ export function useChatStream(endpoint: string = "/api/chat/stream"): UseChatStr
                 setConfidence(event.confidence);
                 setTablesUsed(event.tables_used ?? []);
                 setSessionId(event.session_id);
-                setSqlToken(event.sql_token ?? null);
                 setStatus(null);
                 setDone(true);
                 break;
@@ -308,6 +322,5 @@ export function useChatStream(endpoint: string = "/api/chat/stream"): UseChatStr
     done,
     confidence,
     tablesUsed,
-    sqlToken,
   };
 }

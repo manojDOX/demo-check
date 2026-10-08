@@ -31,7 +31,12 @@ import re
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 
-from app.modules.chat_bot import data_availability, drill_down, guardrails, prompts, result_summary
+from app.modules.chat_bot import data_availability, guardrails, prompts, result_summary
+from app.modules.chat_bot.answer_utils import (
+    CUSTOMER_LEVEL_ACTIVE_NOTE,
+    infer_charts as _infer_charts,
+    strip_markdown_formatting as _strip_markdown_formatting,
+)
 from app.modules.chat_bot.config import (
     CHATBOT_ANSWER_MAX_TOKENS,
     CHATBOT_ANSWER_ROWS_SAMPLE,
@@ -69,24 +74,6 @@ _EMPTY_RESPONSE_NUDGE = (
 # below is a defensive net in case Google renames/adds an execute-style tool later.
 _KNOWN_SQL_TOOL_NAMES = {"execute_sql_readonly", "execute_sql"}
 
-# Belt-and-braces cleanup for the final answer text: query-result.tsx's FormattedAnswerText
-# renders exactly "**bold**", "- " bullets, and blank-line paragraph breaks — nothing else — so
-# **bold** is intentionally left alone here (the UI now interprets it), but markdown headers
-# (#, ##, ...) aren't part of that supported subset and LLMs reliably reach for them anyway
-# despite the prompt's instruction not to — live-verified across providers that the instruction
-# alone isn't consistently followed. Strips just the header markers, leaving the header text.
-_MD_HEADER_RE = re.compile(r"(?m)^#{1,6}[ \t]+")
-
-
-def _strip_markdown_formatting(text: str) -> str:
-    if not text:
-        return text
-    text = _MD_HEADER_RE.sub("", text)
-    # Inline code spans aren't rendered either; in answers they only ever wrap raw column names.
-    text = text.replace("`", "")
-    return text
-
-
 def _is_sql_tool(name: str) -> bool:
     if name in _KNOWN_SQL_TOOL_NAMES:
         return True
@@ -96,11 +83,6 @@ def _is_sql_tool(name: str) -> bool:
 
 def _extract_sql_from_arguments(arguments: dict) -> str:
     return arguments.get("query") or arguments.get("sql") or ""
-
-
-def _set_sql_argument(arguments: dict, sql: str) -> None:
-    key = "sql" if arguments.get("sql") and not arguments.get("query") else "query"
-    arguments[key] = sql
 
 
 _TABLE_REF_RE = re.compile(r"`?([a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)`?")
@@ -130,13 +112,6 @@ _AGGREGATE_SHAPE_RE = re.compile(r"\b(COUNT|SUM|AVG|MIN|MAX)\s*\(|\bGROUP\s+BY\b
 def _is_list_shaped_sql(sql: str) -> bool:
     return not _AGGREGATE_SHAPE_RE.search(sql or "")
 
-
-# Added by the application, not the model, so the wording is identical on every run.
-CUSTOMER_LEVEL_ACTIVE_NOTE = (
-    "Note: this figure is at the customer level. It counts each customer with at least one active "
-    "subscription once, even when a customer holds several active memberships, so it can be lower than "
-    "the total number of active memberships."
-)
 
 _FALSE_FILTER_RE = re.compile(
     r"NOT\s+(?:COALESCE\s*\(\s*)?has_active_subscription\b"
@@ -256,11 +231,6 @@ def _looks_like_bq_rows(structured) -> bool:
 
 
 _DATE_FIELD_TYPES = {"DATE", "DATETIME", "TIMESTAMP", "TIME"}
-_NUMERIC_FIELD_TYPES = {"INT64", "INTEGER", "FLOAT64", "FLOAT", "NUMERIC", "BIGNUMERIC"}
-
-
-def _humanize_column(name: str) -> str:
-    return name.replace("_", " ").strip().title()
 
 
 def _find_date_range(fields: list[dict], data: list[dict]) -> tuple[str, str, str] | None:
@@ -281,41 +251,6 @@ def _find_date_range(fields: list[dict], data: list[dict]) -> tuple[str, str, st
             continue
         return name, min(values), max(values)
     return None
-
-
-def _infer_charts(fields: list[dict], data: list[dict]) -> list[dict]:
-    """Heuristic chart suggestion straight from the BigQuery result schema — no extra LLM
-    round trip needed. A date/time-typed column becomes a line-chart x-axis (trend over
-    time); any other non-numeric column becomes a bar-chart x-axis (category breakdown).
-    Deliberately returns [] (table-only) when there's nothing meaningful to plot: a single
-    scalar-result row (e.g. "how many customers do we have"), or no numeric column to use
-    as a y-axis at all (e.g. a plain SELECT DISTINCT listing)."""
-    if len(data) < 2:
-        return []
-    field_types = {f.get("name"): (f.get("type") or "").upper() for f in fields}
-    numeric_cols = [c for c, t in field_types.items() if t in _NUMERIC_FIELD_TYPES]
-    if not numeric_cols:
-        return []
-    date_cols = [c for c, t in field_types.items() if t in _DATE_FIELD_TYPES]
-    x_field = date_cols[0] if date_cols else next(
-        (c for c in field_types if c not in numeric_cols), None
-    )
-    if x_field is None:
-        return []
-    y_field = next((c for c in numeric_cols if c != x_field), None)
-    if y_field is None:
-        return []
-    chart_type = "line" if date_cols else "bar"
-    return [
-        {
-            "type": chart_type,
-            "title": f"{_humanize_column(y_field)} by {_humanize_column(x_field)}",
-            "x_field": x_field,
-            "y_field": y_field,
-            "x_label": _humanize_column(x_field),
-            "y_label": _humanize_column(y_field),
-        }
-    ]
 
 
 async def _run_capped_summary(mcp, project_id: str, result: dict) -> result_summary.CappedSummary | None:
@@ -374,16 +309,12 @@ def _build_initial_messages(
     message: str,
     min_session_date: str | None,
     min_customer_created_date: str | None,
-    drill: drill_down.DrillContext | None = None,
 ) -> list[dict]:
     messages: list[dict] = [
         {
             "role": "system",
             "content": prompts.build_sql_generation_system_prompt(
-                message,
-                min_session_date,
-                min_customer_created_date,
-                drill_block=drill_down.build_prompt_block(drill) if drill is not None else "",
+                message, min_session_date, min_customer_created_date
             ),
         }
     ]
@@ -411,7 +342,6 @@ async def stream_single_query(
     api_key: str,
     message: str,
     conversation_history: list[dict] | None,
-    drill: drill_down.DrillContext | None = None,
 ) -> AsyncGenerator[dict, None]:
     # --- MCP client construction --------------------------------------------------------
     try:
@@ -441,9 +371,7 @@ async def stream_single_query(
         # data_availability.py's module docstring for why this is safe to compute once and cache
         # rather than refresh periodically.
         min_session_date, min_customer_created_date = await data_availability.get_min_dates(db, connection)
-        messages = _build_initial_messages(
-            conversation_history, message, min_session_date, min_customer_created_date, drill
-        )
+        messages = _build_initial_messages(conversation_history, message, min_session_date, min_customer_created_date)
         tables_used: list[str] = []
         # Set the moment a SQL tool call comes back with real rows — once this is populated
         # the round loop below breaks out and hands off to a SEPARATE answer-generation call
@@ -520,14 +448,6 @@ async def stream_single_query(
                 bad_join_reason: str | None = None
                 if _is_sql_tool(name):
                     sql = _extract_sql_from_arguments(arguments)
-                    if drill is not None:
-                        if drill_down.references_previous_segment(sql):
-                            # Compose BEFORE the guardrails below so they check (and the UI shows)
-                            # the full query that actually runs, not the model's fragment.
-                            sql = drill_down.compose_drill_sql(sql, drill.base_sql)
-                            _set_sql_argument(arguments, sql)
-                        else:
-                            bad_join_reason = drill_down.MISSING_SEGMENT_REASON
                     is_safe, unsafe_reason = guardrails.check_sql_safety(sql)
                     if not is_safe:
                         yield {
@@ -683,7 +603,7 @@ async def stream_single_query(
             summary = await _run_capped_summary(mcp, connection.project_id, successful_result)
         total_rows, unique_customers, total_exact = _result_totals(successful_result, summary)
         # The `rows` event above carried the MCP tool's own total, which isn't reliable once
-        # capped — this corrects it for the UI (card banner, drill breadcrumb) and persistence.
+        # capped — this corrects it for the UI (card banner) and persistence.
         yield {
             "type": "row_count",
             "total_rows": total_rows,
@@ -746,8 +666,6 @@ async def stream_single_query(
                 "customers, not memberships. Do not write that note yourself and do not compare it with a "
                 "membership total."
             )
-        if drill is not None:
-            query_result_block += drill_down.build_answer_note(drill)
         answer_messages = [
             {"role": "system", "content": prompts.build_answer_generation_system_prompt(message, query_result_block)},
             {"role": "user", "content": message},

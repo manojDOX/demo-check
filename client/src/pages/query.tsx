@@ -61,7 +61,6 @@ interface ChatMessageRecord {
   confidence: number | null;
   tablesUsed: string[] | null;
   rows: unknown;
-  sqlToken?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -74,7 +73,6 @@ interface ConversationTurn {
   rows: ChatRowsPayload | null;
   confidence: number | null;
   tablesUsed: string[];
-  sqlToken: string | null;
   // Set on the first turn asked right after a "Clear History" click, so the transcript can
   // show a divider there — the turn itself and everything after it stays fully visible,
   // only what's sent to the LLM as context resets at this point.
@@ -105,7 +103,6 @@ interface DrillStep {
   question: string;
   summary: string;
   sql: string | null;
-  sqlToken: string | null;
   rows: ChatRowsPayload | null;
 }
 
@@ -114,11 +111,11 @@ interface DrillState {
   activeIndex: number;
 }
 
-// Follow-up steps join other views on client_id, so only customer-level results with a
-// server-signed SQL can be narrowed.
-function canDrill(step: Pick<DrillStep, "sql" | "sqlToken" | "rows">): boolean {
+// Only a customer-level list (it has client_id) that carries the query that produced it can be
+// narrowed. Answers from the backup engine, customer lookups and older chats have no query.
+function canDrill(step: Pick<DrillStep, "rows">): boolean {
   return Boolean(
-    step.sql && step.sqlToken && step.rows?.columns.some((column) => column.toLowerCase() === "client_id"),
+    step.rows?.spec && step.rows.columns.some((column) => column.toLowerCase() === "client_id"),
   );
 }
 
@@ -192,7 +189,6 @@ export default function QueryPage() {
         rows: chat.rows,
         confidence: chat.confidence,
         tablesUsed: chat.tablesUsed,
-        sqlToken: chat.sqlToken,
         historyClearedBefore: pendingHistoryClear,
       },
     ]);
@@ -223,7 +219,6 @@ export default function QueryPage() {
           question: drillQuestion,
           summary: drillChat.text,
           sql: drillChat.sql,
-          sqlToken: drillChat.sqlToken,
           rows: drillChat.rows,
         },
       ];
@@ -263,9 +258,8 @@ export default function QueryPage() {
       drillChat.send(question, {
         sessionId,
         extraBody: {
-          baseSql: base.sql,
-          baseToken: base.sqlToken,
-          baseColumns: base.rows?.columns ?? [],
+          baseView: base.rows?.spec?.view ?? "",
+          baseSpec: base.rows?.spec?.spec ?? {},
           chain: drill.steps
             .slice(0, drill.activeIndex + 1)
             .map((step) => ({ question: step.question, rowCount: step.rows?.totalRows ?? null })),
@@ -292,7 +286,6 @@ export default function QueryPage() {
           question: turn.question,
           summary: turn.summary,
           sql: turn.sql,
-          sqlToken: turn.sqlToken,
           rows: turn.rows,
         },
       ],
@@ -346,7 +339,6 @@ export default function QueryPage() {
             rows: normalizeChatRows(next.rows),
             confidence: next.confidence ?? null,
             tablesUsed: next.tablesUsed ?? [],
-            sqlToken: next.sqlToken ?? null,
           });
           i++;
         } else {
@@ -358,7 +350,6 @@ export default function QueryPage() {
             rows: null,
             confidence: null,
             tablesUsed: [],
-            sqlToken: null,
           });
         }
       }
@@ -601,6 +592,8 @@ export default function QueryPage() {
             totalRows={stream.rows?.totalRows}
             uniqueCustomers={stream.rows?.uniqueCustomers ?? null}
             totalExact={stream.rows?.totalExact ?? true}
+            explain={stream.rows?.explain ?? null}
+            querySpec={stream.rows?.spec ?? null}
           />
         </div>
       )}
@@ -669,6 +662,8 @@ export default function QueryPage() {
           totalRows={activeDrillStep.rows?.totalRows}
           uniqueCustomers={activeDrillStep.rows?.uniqueCustomers ?? null}
           totalExact={activeDrillStep.rows?.totalExact ?? true}
+          explain={activeDrillStep.rows?.explain ?? null}
+          querySpec={activeDrillStep.rows?.spec ?? null}
         />
       )}
 
@@ -694,6 +689,8 @@ export default function QueryPage() {
             totalRows={turn.rows?.totalRows}
             uniqueCustomers={turn.rows?.uniqueCustomers ?? null}
             totalExact={turn.rows?.totalExact ?? true}
+            explain={turn.rows?.explain ?? null}
+            querySpec={turn.rows?.spec ?? null}
             onDrillDown={canDrill(turn) && !chat.isStreaming ? () => handleDrillDown(turn) : undefined}
           />
         </div>

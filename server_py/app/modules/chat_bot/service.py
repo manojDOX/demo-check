@@ -1,6 +1,10 @@
 """Orchestration layer: session mgmt, history load, SSE event forwarding, DB persistence,
-billing. Owns everything sql_agent.py deliberately does NOT — input-safety gating, the
-`session` SSE event, ChatSession/ChatMessage writes, and the usage-increment decision.
+billing. Owns everything the engines deliberately do NOT — input-safety gating, the `session` SSE
+event, ChatSession/ChatMessage writes, and the usage-increment decision.
+
+Two engines answer a question. The AutoCare MCP agent (autocare_agent.py) is the main one: the model calls
+structured tools and never writes SQL. The old SQL agent (sql_agent.py) is only a fallback, used when the
+AutoCare service is not available (see _answer_events).
 
 Port of CHATBOT_ARCHITECTURE.md §5b, adapted for XIOMARA's user_id/client_id/connection_id
 tenancy (adaptation #1) and BYO-token owner-resolution for collaborators (adaptation #5).
@@ -8,17 +12,24 @@ tenancy (adaptation #1) and BYO-token owner-resolution for collaborators (adapta
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.chatbot import ChatSession
-from app.modules.chat_bot import drill_down, guardrails, repo, sql_agent
+from app.modules.chat_bot import autocare_agent, autocare_drill, guardrails, repo, sql_agent
+from app.modules.chat_bot.answer_utils import BACKUP_ENGINE_NOTE
+from app.modules.chat_bot.autocare_client import McpUnavailable
 from app.modules.connections import repo as connections_repo
 from app.modules.kpi import repo as kpi_repo
 from app.modules.team import repo as team_repo
 
+logger = logging.getLogger(__name__)
+
 _HISTORY_LOAD_LIMIT = 5
+_MCP_DOWN_MESSAGE = "The analytics service is not available right now. Please try again in a moment."
+_BACKUP_ENGINE_NAME = "sql_fallback"
 
 
 # ---------------------------------------------------------------------------
@@ -142,11 +153,73 @@ def _should_bill(billable: bool | None, confidence: float) -> bool:
     return confidence > 0.2
 
 
-def _result_sql_token(user_id: str, connection_id: int | None, sql: str | None, rows_payload: dict | None) -> str | None:
-    # Only SQL that actually ran and returned rows can be drilled into.
-    if not sql or rows_payload is None or connection_id is None:
-        return None
-    return drill_down.sign_sql(user_id, connection_id, sql)
+# ---------------------------------------------------------------------------
+# Engine selection
+# ---------------------------------------------------------------------------
+
+
+async def _answer_events(
+    *,
+    db: AsyncSession,
+    user_id: str,
+    session: ChatSession,
+    connection,
+    token,
+    message: str,
+    history: list[dict],
+) -> AsyncGenerator[dict, None]:
+    """Answers with the AutoCare MCP agent. If the AutoCare service fails BEFORE any result was produced
+    (cannot connect, timeout, HTTP 5xx, wrong or missing key), answers with the old SQL agent instead and
+    appends a fixed note, provided the client has a BigQuery connection. A wrong answer, a model error,
+    or a failure after a first result never starts the backup engine."""
+    saw_result = False
+    reason = ""
+    try:
+        async for event in autocare_agent.stream_autocare_query(
+            provider=token.provider,
+            model=token.model,
+            api_key=token.llm_api_token,
+            message=message,
+            conversation_history=history,
+        ):
+            if event.get("type") in ("sql", "rows"):
+                saw_result = True
+            yield event
+        return
+    except McpUnavailable as error:
+        reason = str(error)
+    except Exception as error:  # a bug in the new engine must not end the chat stream
+        logger.exception("AutoCare engine failed unexpectedly")
+        reason = f"unexpected error: {error}"
+
+    if saw_result:
+        yield {"type": "error", "content": "The analytics service stopped responding. Please try again in a moment."}
+        yield {"type": "done", "billable": False, "confidence": 0.2, "tables_used": []}
+        return
+
+    logger.warning("AutoCare MCP unavailable (%s); using the backup SQL engine", reason)
+    if connection is None:
+        yield {"type": "error", "content": _MCP_DOWN_MESSAGE}
+        yield {"type": "done", "billable": False, "confidence": 0.0, "tables_used": []}
+        return
+
+    yield {"type": "status", "label": "Main analytics service not available. Using the backup engine…"}
+    async for event in sql_agent.stream_single_query(
+        db=db,
+        user_id=user_id,
+        connection=connection,
+        client_id=session.client_id,
+        provider=token.provider,
+        model=token.model,
+        api_key=token.llm_api_token,
+        message=message,
+        conversation_history=history,
+    ):
+        if event.get("type") == "text":
+            event = {**event, "content": f"{event.get('content') or ''}\n\n{BACKUP_ENGINE_NOTE}"}
+        elif event.get("type") == "rows":
+            event = {**event, "engine": _BACKUP_ENGINE_NAME}
+        yield event
 
 
 # ---------------------------------------------------------------------------
@@ -176,16 +249,11 @@ async def stream_chat(
 
     yield {"type": "session", "session_id": session.id, "name": session.name}
 
+    # The BigQuery connection is only needed by the backup SQL engine; the AutoCare MCP engine reads one
+    # fixed dataset whatever client is selected.
     connection = None
     if session.connection_id:
         connection = await connections_repo.get_connection(db, session.connection_id)
-    if connection is None:
-        yield {
-            "type": "error",
-            "content": "No BigQuery connection is configured for this client yet.",
-        }
-        yield {"type": "done", "confidence": 0.0, "tables_used": [], "session_id": session.id}
-        return
 
     token = await get_active_token_for(db, user_id, session.client_id)
     if token is None:
@@ -208,16 +276,14 @@ async def stream_chat(
     answer_parts: list[str] = []
     billable: bool | None = None
 
-    async for event in sql_agent.stream_single_query(
+    async for event in _answer_events(
         db=db,
         user_id=user_id,
+        session=session,
         connection=connection,
-        client_id=session.client_id,
-        provider=token.provider,
-        model=token.model,
-        api_key=token.llm_api_token,
+        token=token,
         message=message,
-        conversation_history=conversation_history,
+        history=conversation_history,
     ):
         event_type = event.get("type")
         if event_type == "sql":
@@ -258,14 +324,13 @@ async def stream_chat(
         "confidence": final_confidence,
         "tables_used": final_tables_used,
         "session_id": session.id,
-        "sql_token": _result_sql_token(user_id, session.connection_id, final_sql, final_rows_payload),
     }
 
 
 def _error_events(content: str, session_id: str | None) -> list[dict]:
     return [
         {"type": "error", "content": content},
-        {"type": "done", "confidence": 0.0, "tables_used": [], "session_id": session_id, "sql_token": None},
+        {"type": "done", "confidence": 0.0, "tables_used": [], "session_id": session_id},
     ]
 
 
@@ -274,14 +339,13 @@ async def stream_drill_step(
     user_id: str,
     session_id: str,
     message: str,
-    base_sql: str,
-    base_token: str,
-    base_columns: list[str],
+    base_view: str,
+    base_spec: dict,
     chain: list[dict],
 ) -> AsyncGenerator[dict, None]:
-    """One segment drill-down step: answers `message` only within the result of `base_sql` (a
-    previous step's signed SQL). Unlike stream_chat, nothing is persisted and no chat history is
-    used — drill steps live only in the browser (see drill_down.py)."""
+    """One segment drill-down step: answers `message` only within the previous step's segment. The new
+    query must keep every filter of `base_spec` (see autocare_drill.py). Unlike stream_chat, nothing is
+    persisted, no chat history is used, and there is no backup engine: a drill step needs the spec."""
     is_safe, block_reason = guardrails.check_input_safety(message)
     if not is_safe:
         for event in _error_events(block_reason or "This message can't be processed.", session_id):
@@ -289,22 +353,8 @@ async def stream_drill_step(
         return
 
     session = await repo.get_session(db, session_id)
-    if session is None or session.connection_id is None:
+    if session is None:
         for event in _error_events("This chat session is no longer available.", session_id):
-            yield event
-        return
-
-    if not drill_down.verify_sql(user_id, session.connection_id, base_sql, base_token):
-        for event in _error_events(
-            "This segment can't be narrowed any more — run the original question again, then drill down.",
-            session.id,
-        ):
-            yield event
-        return
-
-    connection = await connections_repo.get_connection(db, session.connection_id)
-    if connection is None:
-        for event in _error_events("No BigQuery connection is configured for this client yet.", session.id):
             yield event
         return
 
@@ -314,46 +364,52 @@ async def stream_drill_step(
             yield event
         return
 
-    drill = drill_down.DrillContext(
-        base_sql=base_sql,
-        base_columns=drill_down.sanitize_columns(base_columns),
-        chain=[step for step in drill_down.sanitize_chain(chain) if guardrails.check_input_safety(step.question)[0]],
+    try:
+        view, spec = autocare_drill.sanitize_base_spec(base_view, base_spec)
+    except ValueError as error:
+        for event in _error_events(
+            f"This segment can't be narrowed: {error} Run the original question again, then drill down.",
+            session.id,
+        ):
+            yield event
+        return
+
+    drill = autocare_drill.DrillContext(
+        base_view=view,
+        base_spec=spec,
+        chain=[step for step in autocare_drill.sanitize_chain(chain) if guardrails.check_input_safety(step.question)[0]],
     )
 
-    final_sql: str | None = None
-    final_rows_payload: dict | None = None
     final_confidence = 0.0
     final_tables_used: list[str] = []
     billable: bool | None = None
 
-    async for event in sql_agent.stream_single_query(
-        db=db,
-        user_id=user_id,
-        connection=connection,
-        client_id=session.client_id,
-        provider=token.provider,
-        model=token.model,
-        api_key=token.llm_api_token,
-        message=message,
-        conversation_history=[],
-        drill=drill,
-    ):
-        event_type = event.get("type")
-        if event_type == "done":
-            final_confidence = event.get("confidence", final_confidence)
-            if event.get("tables_used"):
-                final_tables_used = event["tables_used"]
-            billable = event.get("billable")
-            continue
-        if event_type == "sql":
-            final_sql = event.get("content")
-            if event.get("tables_used"):
-                final_tables_used = event["tables_used"]
-        elif event_type == "rows":
-            final_rows_payload = {k: v for k, v in event.items() if k != "type"}
-        elif event_type == "row_count" and final_rows_payload is not None:
-            final_rows_payload.update({k: v for k, v in event.items() if k != "type"})
-        yield event
+    try:
+        async for event in autocare_agent.stream_autocare_query(
+            provider=token.provider,
+            model=token.model,
+            api_key=token.llm_api_token,
+            message=message,
+            conversation_history=[],
+            drill=drill,
+        ):
+            if event.get("type") == "done":
+                final_confidence = event.get("confidence", final_confidence)
+                if event.get("tables_used"):
+                    final_tables_used = event["tables_used"]
+                billable = event.get("billable")
+                continue
+            yield event
+    except McpUnavailable as error:
+        logger.warning("AutoCare MCP unavailable during a drill-down step: %s", error)
+        for event in _error_events(_MCP_DOWN_MESSAGE, session.id):
+            yield event
+        return
+    except Exception:
+        logger.exception("Drill-down step failed unexpectedly")
+        for event in _error_events("Something went wrong while narrowing this segment. Please try again.", session.id):
+            yield event
+        return
 
     if _should_bill(billable, final_confidence):
         await repo.increment_usage(db, user_id)
@@ -363,5 +419,4 @@ async def stream_drill_step(
         "confidence": final_confidence,
         "tables_used": final_tables_used,
         "session_id": session.id,
-        "sql_token": _result_sql_token(user_id, session.connection_id, final_sql, final_rows_payload),
     }

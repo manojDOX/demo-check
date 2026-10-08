@@ -13,6 +13,19 @@ BQ_OAUTH_SCOPE = "https://www.googleapis.com/auth/bigquery"
 # implementation's MAX_TOOL_ROUNDS).
 CHATBOT_MAX_TOOL_ROUNDS = 8
 
+# --- AutoCare MCP engine (autocare_agent.py) ---------------------------------------------------
+# Max LLM <-> tool round trips for one question.
+AUTOCARE_MAX_TOOL_ROUNDS = 8
+# Output-token budget for each model turn. Reasoning models spend part of it thinking before they write
+# a tool call or an answer, so it is generous (unused budget costs nothing).
+AUTOCARE_MAX_TOKENS = 4000
+# The result table shows at most this many rows. A list question without a `limit` gets this limit, and a
+# larger `limit` is cut to it. The true size of the answer comes back as total_rows.
+AUTOCARE_ROW_LIMIT = 500
+# What the model itself sees of a result: at most this many rows and characters.
+AUTOCARE_MAX_ROWS_TO_MODEL = 60
+AUTOCARE_MAX_RESULT_CHARS = 20000
+
 # Output-token budgets for the SQL-writing (tool-calling) and answer-writing LLM calls. Sized for
 # reasoning models (e.g. gpt-oss via OpenRouter), whose hidden reasoning counts against the same
 # budget before any SQL or text is produced — a 1000-token cap was observed to be exhausted on a

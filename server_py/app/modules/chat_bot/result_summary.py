@@ -14,6 +14,8 @@ import re
 from dataclasses import dataclass, field
 from datetime import date
 
+from app.modules.chat_bot.answer_utils import build_partial_list_note  # noqa: F401  (re-export)
+
 MAX_CATEGORY_COLUMNS = 4
 MAX_CATEGORY_VALUES = 10
 MAX_DATE_BUCKETS = 60
@@ -231,13 +233,3 @@ def format_summary_block(sql: str, summary: CappedSummary) -> str:
             + "; ".join(f"{bucket}: {count:,}" for bucket, count in summary.date_buckets)
         )
     return "\n".join(lines)
-
-
-def build_partial_list_note(shown: int, total: int, total_exact: bool, unique_customers: int | None) -> str:
-    customers = f" ({unique_customers:,} unique customers)" if unique_customers is not None else ""
-    of_total = f"{total:,}" if total_exact else f"more than {total:,}"
-    return (
-        f"Note: the table shows the first {shown:,} of {of_total} matching rows{customers}. The table, CSV "
-        f"download, Crear Segmento and Send to GHL include only those {shown:,} rows — narrow the question "
-        "(for example by location or date range) to get the complete list."
-    )
