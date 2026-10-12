@@ -594,6 +594,7 @@ export default function QueryPage() {
             totalExact={stream.rows?.totalExact ?? true}
             explain={stream.rows?.explain ?? null}
             querySpec={stream.rows?.spec ?? null}
+            sessionId={sessionId}
           />
         </div>
       )}
@@ -664,6 +665,7 @@ export default function QueryPage() {
           totalExact={activeDrillStep.rows?.totalExact ?? true}
           explain={activeDrillStep.rows?.explain ?? null}
           querySpec={activeDrillStep.rows?.spec ?? null}
+          sessionId={sessionId}
         />
       )}
 
@@ -691,6 +693,7 @@ export default function QueryPage() {
             totalExact={turn.rows?.totalExact ?? true}
             explain={turn.rows?.explain ?? null}
             querySpec={turn.rows?.spec ?? null}
+            sessionId={sessionId}
             onDrillDown={canDrill(turn) && !chat.isStreaming ? () => handleDrillDown(turn) : undefined}
           />
         </div>

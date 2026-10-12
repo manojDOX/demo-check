@@ -87,6 +87,8 @@ interface QueryResultProps {
   // Plain-words calculation lines and the query that made this result ("How it was calculated").
   explain?: ChatExplain | null;
   querySpec?: ChatQuerySpec | null;
+  // Chat session of this result. With `querySpec` it lets the server build the full CSV.
+  sessionId?: string | null;
 }
 
 const CHART_COLORS = [
@@ -178,6 +180,7 @@ export function QueryResult({
   totalExact = true,
   explain = null,
   querySpec = null,
+  sessionId = null,
 }: QueryResultProps) {
   const [vizType, setVizType] = useState<VisualizationType>(initialType);
   const [isSaved, setIsSaved] = useState(initialSaved);
@@ -453,7 +456,64 @@ export function QueryResult({
     }
   };
 
+  // The table shows only the first rows. When the result is bigger, the server builds the full CSV
+  // and the browser only saves the file.
+  const canExportAll =
+    Boolean(sessionId) &&
+    querySpec?.tool === "query" &&
+    totalRows !== undefined &&
+    totalRows > (data?.length ?? 0);
+  const [isExporting, setIsExporting] = useState(false);
+
+  const handleExportAll = async () => {
+    if (!sessionId || !querySpec || isExporting) return;
+    setIsExporting(true);
+    try {
+      const res = await fetch("/api/chat/export", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId, baseView: querySpec.view, baseSpec: querySpec.spec }),
+      });
+      if (!res.ok) {
+        let detail = "No se pudo descargar el archivo";
+        try {
+          const body = await res.json();
+          if (typeof body?.detail === "string") detail = body.detail;
+        } catch {
+          // keep the default text
+        }
+        throw new Error(detail);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `query-result-${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      toast({
+        title: "Descarga iniciada",
+        description: `Archivo CSV con ${(totalRows ?? 0).toLocaleString()} filas`,
+      });
+    } catch (error) {
+      toast({
+        title: "Error",
+        description: error instanceof Error ? error.message : "No se pudo descargar el archivo",
+        variant: "destructive",
+      });
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
   const handleDownloadCsv = () => {
+    if (canExportAll) {
+      void handleExportAll();
+      return;
+    }
     if (!data || data.length === 0) {
       toast({
         title: "Sin datos",
@@ -1161,9 +1221,18 @@ export function QueryResult({
                 size="icon" 
                 data-testid="button-download-result"
                 onClick={handleDownloadCsv}
-                title="Descargar CSV"
+                disabled={isExporting}
+                title={
+                  canExportAll
+                    ? `Descargar CSV (${(totalRows ?? 0).toLocaleString()} filas)`
+                    : "Descargar CSV"
+                }
               >
-                <Download className="h-4 w-4" />
+                {isExporting ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Download className="h-4 w-4" />
+                )}
               </Button>
               <Button 
                 variant="outline" 

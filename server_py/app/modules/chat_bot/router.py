@@ -8,6 +8,7 @@ app/main.py (not done here — see the port task's rules).
 from __future__ import annotations
 
 import json
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -18,10 +19,13 @@ from app.core.serialize import to_camel, to_camel_list
 from app.db import SessionLocal, get_db
 from app.dependencies import can_access_client, get_user_id, require_authenticated_or_token
 from app.models.chatbot import ChatbotToken, ChatSession
-from app.modules.chat_bot import repo, service
+from app.modules.chat_bot import autocare_export, repo, service
+from app.modules.chat_bot.autocare_client import AutoCareClient, McpToolError, McpUnavailable
 from app.modules.chat_bot.llm_client import discover_models
 
-router = APIRouter(tags=["chat-bot"], dependencies=[Depends(require_authenticated_or_token)])
+logger = logging.getLogger(__name__)
+
+router =APIRouter(tags=["chat-bot"], dependencies=[Depends(require_authenticated_or_token)])
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +113,70 @@ async def chat_drill_stream(body: DrillStreamBody, request: Request, db: AsyncSe
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
+
+
+class ExportBody(BaseModel):
+    sessionId: str
+    baseView: str | None = None
+    baseSpec: dict
+
+
+@router.post("/api/chat/export")
+async def chat_export(body: ExportBody, request: Request, db: AsyncSession = Depends(get_db)):
+    """All rows of a chat result as a CSV file. The browser sends the saved query spec; the server
+    reads every page from the AutoCare MCP server and streams the CSV."""
+    user_id = get_user_id(request)
+    session = await repo.get_session(db, body.sessionId)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if not await _can_access_session(request, db, session, user_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    try:
+        _view, spec = autocare_export.prepare_spec(body.baseView, body.baseSpec)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+    client = None
+    try:
+        client = AutoCareClient()
+        first, total = await autocare_export.start_export(client, spec)
+    except autocare_export.ExportTooLarge as error:
+        await _close(client)
+        raise HTTPException(status_code=413, detail=str(error))
+    except McpToolError as error:
+        await _close(client)
+        raise HTTPException(status_code=400, detail=f"The query could not be exported: {error}")
+    except McpUnavailable as error:
+        await _close(client)
+        logger.warning("Chat export failed: %s", error)
+        raise HTTPException(status_code=503, detail="The data service is not available. Try again later.")
+
+    async def body_stream():
+        try:
+            async for chunk in autocare_export.iter_csv(client, spec, first, total):
+                yield chunk
+        except (McpUnavailable, McpToolError) as error:
+            # The file already started. Ending it early would look like a complete file, so abort the stream.
+            logger.warning("Chat export stopped part-way: %s", error)
+            raise
+        finally:
+            await client.aclose()
+
+    return StreamingResponse(
+        body_stream(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="chat-result.csv"',
+            "X-Total-Rows": str(total),
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+async def _close(client) -> None:
+    if client is not None:
+        await client.aclose()
 
 
 # ---------------------------------------------------------------------------
